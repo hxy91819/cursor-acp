@@ -254,6 +254,8 @@ function createAgentTestHarness(
 		promptText: string;
 		backendSessionId?: string;
 		reviewPolicy?: RunPromptOptions["reviewPolicy"];
+		thinkingLevel?: string;
+		fastValue?: string;
 	}[] = [];
 
 	const runner: TestCliRunner = {
@@ -276,6 +278,8 @@ function createAgentTestHarness(
 				promptText: options.prompt,
 				backendSessionId: options.backendSessionId,
 				reviewPolicy: options.reviewPolicy,
+				thinkingLevel: options.thinkingLevel,
+				fastValue: options.fastValue,
 			});
 			const completed = (async () => {
 				if (legacyPromptHandler) {
@@ -1308,6 +1312,163 @@ describe("CursorAcpAgent", () => {
 		expect(response.configOptions.find((option) => option.id === "fast")).toMatchObject({
 			type: "boolean",
 			currentValue: false,
+		});
+	});
+
+	it("exposes boolean thinking and fast parameters as toggles and applies their values", async () => {
+		const models: CursorModelDescriptor[] = [
+			{
+				modelId: "gpt-5.6-sol",
+				name: "GPT-5.6 Sol",
+				current: true,
+				parameters: [
+					{
+						id: "reasoning",
+						displayName: "Thinking",
+						values: [
+							{ value: "false", displayName: "Off" },
+							{ value: "true", displayName: "On" },
+						],
+					},
+					{
+						id: "fast",
+						values: [{ value: "false" }, { value: "true" }],
+					},
+				],
+				variants: [
+					{
+						params: [
+							{ id: "reasoning", value: "true" },
+							{ id: "fast", value: "true" },
+						],
+						isDefault: true,
+					},
+				],
+			},
+		];
+		const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-toggle-state-"));
+		process.env.CURSOR_ACP_CONFIG_DIR = tempRoot;
+		const { agent, client, legacyPromptCalls } = createAgentTestHarness({ models });
+		await agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp/toggle-project",
+				default_config_options: { thinking: false, fast: false },
+			}),
+		);
+
+		expect(session.configOptions?.find((option) => option.id === "thinking")).toMatchObject({
+			type: "boolean",
+			currentValue: false,
+		});
+		expect(session.configOptions?.find((option) => option.id === "fast")).toMatchObject({
+			type: "boolean",
+			currentValue: false,
+		});
+
+		client.updates.length = 0;
+		const thinkingOnResponse = await agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "thinking",
+			type: "boolean",
+			value: true,
+		});
+		expect(
+			thinkingOnResponse.configOptions.find((option) => option.id === "thinking"),
+		).toMatchObject({ type: "boolean", currentValue: true });
+		expect(client.updates[client.updates.length - 1]?.update).toEqual({
+			sessionUpdate: "config_option_update",
+			configOptions: thinkingOnResponse.configOptions,
+		});
+		const fastOnResponse = await agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "fast",
+			type: "boolean",
+			value: true,
+		});
+		expect(fastOnResponse.configOptions.find((option) => option.id === "fast")).toMatchObject({
+			type: "boolean",
+			currentValue: true,
+		});
+		expect(client.updates[client.updates.length - 1]?.update).toEqual({
+			sessionUpdate: "config_option_update",
+			configOptions: fastOnResponse.configOptions,
+		});
+
+		await agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "thinking",
+			type: "boolean",
+			value: false,
+		});
+		const fastOffResponse = await agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "fast",
+			type: "boolean",
+			value: false,
+		});
+		expect(client.updates[client.updates.length - 1]?.update).toEqual({
+			sessionUpdate: "config_option_update",
+			configOptions: fastOffResponse.configOptions,
+		});
+
+		await agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "hello" }],
+		});
+		expect(legacyPromptCalls[0]).toMatchObject({
+			thinkingLevel: "false",
+			fastValue: "false",
+		});
+
+		const reloadedHarness = createAgentTestHarness({ models });
+		await reloadedHarness.agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const loaded = await reloadedHarness.agent.loadSession({
+			sessionId: session.sessionId,
+			cwd: "/tmp/toggle-project",
+			mcpServers: [],
+		});
+		expect(loaded.configOptions?.find((option) => option.id === "thinking")).toMatchObject({
+			type: "boolean",
+			currentValue: false,
+		});
+		expect(loaded.configOptions?.find((option) => option.id === "fast")).toMatchObject({
+			type: "boolean",
+			currentValue: false,
+		});
+
+		delete process.env.CURSOR_ACP_CONFIG_DIR;
+		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	it("falls back to selectors for boolean-shaped parameters on legacy clients", async () => {
+		const { agent } = createAgentTestHarness({
+			models: [
+				{
+					modelId: "gpt-5.6-sol",
+					name: "GPT-5.6 Sol",
+					current: true,
+					parameters: [
+						{ id: "thinking", values: [{ value: "false" }, { value: "true" }] },
+						{ id: "fast", values: [{ value: "false" }, { value: "true" }] },
+					],
+				},
+			],
+		});
+		await agent.initialize(initRequest({ clientCapabilities: {} }));
+		const session = await agent.newSession(newSessionRequest());
+
+		expect(session.configOptions?.find((option) => option.id === "thinking")).toMatchObject({
+			type: "select",
+			currentValue: "false",
+		});
+		expect(session.configOptions?.find((option) => option.id === "fast")).toMatchObject({
+			type: "select",
+			currentValue: "false",
 		});
 	});
 

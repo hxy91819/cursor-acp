@@ -29,7 +29,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - **Session persistence & history replay**: Stores visible history locally and replays it on resume/load
 - **Session listing**: Lists past local sessions with optional cwd filtering and pagination
 - **Model listing and selection**: `/model` and ACP config options use the SDK catalog.
-- **ACP 1.4 controls**: Clients that advertise boolean config support render Fast as a toggle; older clients receive a select fallback. Thinking remains a model-specific selector that maps SDK `thinking`, `reasoning`, or `effort` parameters. After `session/set_config_option`, the adapter sends `config_option_update` so dependent Fast and Thinking controls appear immediately.
+- **ACP 1.4 controls**: Clients that advertise boolean config support receive Fast and on/off Thinking parameters as native toggles; older clients receive a select fallback. Multi-level thinking/reasoning/effort parameters remain selectors. After `session/set_config_option`, the adapter sends `config_option_update` so dependent Fast and Thinking controls appear immediately.
 - **SDK authentication**: `/login`, `/logout`, `/status`, `CURSOR_API_KEY`, and ACP terminal authentication use Cursor SDK credentials. Browser login is stored under `~/.cursor/sdk/auth.json`.
 - **Optional Yolo mode** (`yolo`): Disables Auto Review for unrestricted local SDK execution.
 - **Commit and PR attribution**: Honors Cursor's global `cli-config.json` attribution flags. Project `.cursor/cli.json` does not override them.
@@ -179,7 +179,7 @@ If `cursor-acp` is not on your PATH, use the full absolute path to the entry poi
 
 #### Default mode, model, Fast, and Thinking
 
-Zed versions with ACP config defaults apply initial controls from `default_config_options`; they may send these as follow-up `session/set_config_option` requests after creating the session. The adapter then sends a `config_option_update` so dependent Fast and Thinking controls appear immediately. When the client also advertises boolean config support, Fast appears as a native toggle in the agent panel:
+Zed versions with ACP config defaults apply initial controls from `default_config_options`; they may send these as follow-up `session/set_config_option` requests after creating the session. The adapter then sends a `config_option_update` so dependent Fast and Thinking controls appear immediately. When the client also advertises boolean config support, Fast and on/off Thinking parameters appear as native toggles in the agent panel:
 
 ```json
 {
@@ -202,11 +202,11 @@ Zed versions with ACP config defaults apply initial controls from `default_confi
 - `mode` — one of `auto-review`, `yolo`, `plan`, or `ask`. Omit it to use the shipped `auto-review` default; legacy `default` values still work as an alias.
 - `model` — optional canonical model ID from the Cursor SDK catalog.
 - `fast` — boolean toggle when the selected model advertises a `fast` parameter.
-- `thinking` — ACP config id for the selected model's `thinking`, `reasoning`, or `effort` parameter. Values and the picker label come from the SDK catalog (for example `none` / `low` / `medium` / `high` / `xhigh` / `max`, or Effort `low` / `high`).
+- `thinking` — ACP config id for the selected model's `thinking`, `reasoning`, or `effort` parameter. For on/off parameters, use `true` or `false`. Multi-level parameters use catalog values (for example `none` / `low` / `medium` / `high` / `xhigh` / `max`, or Effort `low` / `high`). The picker label also comes from the SDK catalog.
 
 Legacy Zed fields (`default_mode`, `default_model`, `default_fast`, and `default_thinking`) remain accepted for compatibility. There is no adapter-specific config file. Environment fallbacks are `CURSOR_ACP_DEFAULT_MODE`, `CURSOR_ACP_DEFAULT_MODEL`, and `CURSOR_ACP_DEFAULT_THINKING`.
 
-The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-specific **Fast** and **Thinking** controls appear when the SDK catalog advertises `fast`, `thinking`, `reasoning`, or `effort` parameters. The ACP config id stays `thinking` even when the SDK parameter is `reasoning` or `effort`; the picker label follows the catalog (for example **Effort**). Clients that advertise boolean config support receive Fast as a toggle; other clients receive an On/Off select.
+The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-specific **Fast** and **Thinking** controls appear when the SDK catalog advertises `fast`, `thinking`, `reasoning`, or `effort` parameters. The ACP config id stays `thinking` even when the SDK parameter is `reasoning` or `effort`; the picker label follows the catalog (for example **Effort**). Clients that advertise boolean config support receive parameters offering exactly `true` and `false` as toggles. Other clients receive select controls, and multi-level reasoning parameters remain selectors on all clients.
 
 ### Using in Zed
 

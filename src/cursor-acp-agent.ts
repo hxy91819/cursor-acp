@@ -910,7 +910,8 @@ export class CursorAcpAgent implements Agent {
 	): Promise<SetSessionConfigOptionResponse> {
 		const session = this.requireSession(params.sessionId);
 		const value =
-			params.configId === FAST_PARAM_ID && typeof params.value === "boolean"
+			(params.configId === FAST_PARAM_ID || params.configId === THINKING_PARAM_ID) &&
+			typeof params.value === "boolean"
 				? String(params.value)
 				: params.value;
 		if (typeof value !== "string") {
@@ -1672,7 +1673,14 @@ export class CursorAcpAgent implements Agent {
 					description: "Fast response variant for the selected model",
 					category: "model_config",
 				} as const;
-				if (this.clientCapabilities?.session?.configOptions?.boolean != null) {
+				const booleanShaped =
+					fastParameter.values.length === 2 &&
+					fastParameter.values.some((value) => value.value === "true") &&
+					fastParameter.values.some((value) => value.value === "false");
+				if (
+					booleanShaped &&
+					this.clientCapabilities?.session?.configOptions?.boolean != null
+				) {
 					configOptions.push({
 						...common,
 						type: "boolean",
@@ -1696,18 +1704,36 @@ export class CursorAcpAgent implements Agent {
 				session.modelId,
 			);
 			if (thinkingParameter && session.thinkingLevel) {
-				configOptions.push({
+				const common = {
 					id: THINKING_PARAM_ID,
 					name: thinkingParameter.displayName ?? "Thinking",
 					description: "Thinking or reasoning level for the selected model",
 					category: "thought_level",
-					type: "select",
-					currentValue: session.thinkingLevel,
-					options: thinkingParameter.values.map((value) => ({
-						value: value.value,
-						name: value.displayName ?? value.value,
-					})),
-				});
+				} as const;
+				const booleanShaped =
+					thinkingParameter.values.length === 2 &&
+					thinkingParameter.values.some((value) => value.value === "true") &&
+					thinkingParameter.values.some((value) => value.value === "false");
+				if (
+					booleanShaped &&
+					this.clientCapabilities?.session?.configOptions?.boolean != null
+				) {
+					configOptions.push({
+						...common,
+						type: "boolean",
+						currentValue: session.thinkingLevel === "true",
+					});
+				} else {
+					configOptions.push({
+						...common,
+						type: "select",
+						currentValue: session.thinkingLevel,
+						options: thinkingParameter.values.map((value) => ({
+							value: value.value,
+							name: value.displayName ?? value.value,
+						})),
+					});
+				}
 			}
 		}
 

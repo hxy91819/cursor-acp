@@ -94,6 +94,26 @@ describe("cursor event mapper", () => {
 		});
 	});
 
+	it("maps tool errors to failed ACP updates", () => {
+		const completed = mapCursorEventToAcp(
+			{
+				type: "tool_call",
+				subtype: "completed",
+				call_id: "call_error",
+				tool_call: {
+					readToolCall: {
+						args: { path: "missing.txt" },
+						result: { error: { message: "File not found" } },
+					},
+				},
+			},
+			{ sessionId: "s1", toolUseCache: {} },
+		);
+
+		const update = completed.notifications[0].update as ToolCallNotificationUpdate;
+		expect(update.status).toBe("failed");
+	});
+
 	it("includes terminal cwd and description on shell tool start", () => {
 		const cache: Record<string, CachedToolUse> = {};
 

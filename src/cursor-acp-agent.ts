@@ -1980,7 +1980,7 @@ export class CursorAcpAgent implements Agent {
 
 			const subtype = typeof resultEvent.subtype === "string" ? resultEvent.subtype : "";
 			const isError = resultEvent.is_error === true;
-			if (isError && rejectedToolCalls.length > 0) {
+			if (isError && subtype !== "transport_error" && rejectedToolCalls.length > 0) {
 				return { stopReason: "end_turn", rejectedToolCalls };
 			}
 

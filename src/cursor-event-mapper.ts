@@ -257,7 +257,10 @@ export function mapCursorEventToAcp(
 				result,
 				isShellTool ? shellTerminalId(toolCallId) : undefined,
 			);
-			const status = isRejectedToolResult(result) ? "failed" : "completed";
+			const status =
+				isRejectedToolResult(result) || (result && isObject(result.error))
+					? "failed"
+					: "completed";
 
 			const shellOutputText = isShellTool ? extractToolResultOutputText(result) : null;
 			const shellToolResponseText = isShellTool

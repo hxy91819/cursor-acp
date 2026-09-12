@@ -19,6 +19,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - **Smart Auto Review by default**: New sessions create local SDK agents with `local.autoReview: true`. Cursor's classifier runs approved calls and fails closed on the rest.
 - **ACP permission fallback**: A call stopped by Auto Review is surfaced to the client. “Allow once” retries that turn with Auto Review disabled; “Always allow” switches the session to Yolo.
 - **Correct SDK mode lifecycle**: Auto Review is an agent-level SDK option. Switching review policy closes and resumes the same SDK agent with the new policy; the SDK's unrelated crash-recovery `force` flag is never used as an approval bypass.
+- **Stable prompt lifecycle**: Standalone Cursor transport diagnostics fail the ACP turn instead of being treated as successful replies. Cancellation drains final SDK events and retires an unresponsive agent after a bounded wait.
 - **Model parameters**: Canonical SDK model IDs, thinking/reasoning/effort levels, fast values, and variants flow into SDK model selections. The adapter keeps the catalog's original parameter ids.
 - **MCP and images**: ACP-provided stdio/HTTP/SSE MCP servers and image chunks are forwarded to the SDK.
 - **Agent, Plan, and Ask**: Plan uses the SDK's `plan` send mode. Ask creates a no-tools SDK agent.
@@ -324,6 +325,8 @@ Sessions are persisted under `~/.cursor-acp/sessions/` (or `$CURSOR_ACP_CONFIG_D
 ## Acknowledgments
 
 This project is based on [claude-code-acp](https://github.com/zed-industries/claude-code-acp) by Zed Industries. Their work on the original Claude Code ACP adapter provided the architectural patterns and protocol implementation that made this project possible.
+
+Transport-failure detection and prompt-cancellation lifecycle hardening are adapted from [T3 Code](https://github.com/pingdotgg/t3code). See [NOTICE](NOTICE) for attribution.
 
 ## License
 

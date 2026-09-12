@@ -1975,6 +1975,56 @@ describe("CursorAcpAgent", () => {
 		expect(client.permissionCalls[0]!.toolCall.title).toBe("rm -rf /");
 	});
 
+	it("does not turn a transport failure into an approval retry", async () => {
+		const { agent, client, setLegacyPromptHandler } = createAgentTestHarness();
+
+		await agent.initialize(
+			initRequest({
+				protocolVersion: 1,
+				clientCapabilities: {},
+			}),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp",
+				mcpServers: [],
+			}),
+		);
+
+		setLegacyPromptHandler(async (_promptText, options) => {
+			await options.onEvent?.({
+				type: "tool_call",
+				subtype: "completed",
+				call_id: "t1",
+				tool_call: {
+					shellToolCall: {
+						args: { command: "pwd" },
+						result: { rejected: { command: "pwd", reason: "blocked" } },
+					},
+				},
+			});
+			return {
+				events: [],
+				resultEvent: {
+					type: "result",
+					subtype: "transport_error",
+					is_error: true,
+					result: "Error: RetriableError: WritableIterable is closed",
+				},
+				stderr: "Error: RetriableError: WritableIterable is closed",
+				exitCode: 1,
+			};
+		});
+
+		await expect(
+			agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "run pwd" }],
+			}),
+		).rejects.toThrow(/WritableIterable is closed/);
+		expect(client.permissionCalls).toHaveLength(0);
+	});
+
 	it("auto-approves permission requests in yolo mode", async () => {
 		const { agent, backends, client } = createAgentTestHarness();
 

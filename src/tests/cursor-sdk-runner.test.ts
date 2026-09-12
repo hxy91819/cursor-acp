@@ -49,6 +49,7 @@ describe("CursorSdkRunner", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
 		if (originalConfigDir === undefined) delete process.env.CURSOR_CONFIG_DIR;
 		else process.env.CURSOR_CONFIG_DIR = originalConfigDir;
 		if (originalCommitAttribution === undefined) {
@@ -198,5 +199,253 @@ describe("CursorSdkRunner", () => {
 			}),
 		);
 		expect(events.filter((event) => event.subtype === "started")).toHaveLength(1);
+	});
+
+	it("treats a standalone Cursor transport diagnostic as a failed run", async () => {
+		const diagnostic = "Error: RetriableError: WritableIterable is closed";
+		const agent = sdkAgent("agent-real", [
+			{
+				type: "assistant",
+				agent_id: "agent-real",
+				run_id: "run-1",
+				message: { role: "assistant", content: [{ type: "text", text: diagnostic }] },
+			},
+		]);
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const result = await runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "hello",
+		}).completed;
+
+		expect(result).toMatchObject({
+			exitCode: 1,
+			stderr: diagnostic,
+			resultEvent: { type: "result", subtype: "transport_error", is_error: true },
+		});
+		expect(agent.close).toHaveBeenCalledOnce();
+	});
+
+	it("does not mistake an explanation containing a transport diagnostic for failure", async () => {
+		const agent = sdkAgent("agent-real", [
+			{
+				type: "assistant",
+				agent_id: "agent-real",
+				run_id: "run-1",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text: "The SDK returned Error: RetriableError: WritableIterable is closed",
+						},
+					],
+				},
+			},
+		]);
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const result = await runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "explain the error",
+		}).completed;
+
+		expect(result.resultEvent).toMatchObject({ subtype: "success", is_error: false });
+		expect(agent.close).not.toHaveBeenCalled();
+	});
+
+	it("classifies the final assistant segment after a tool call", async () => {
+		const diagnostic = "Error: ConnectError: [unavailable] transport closed";
+		const agent = sdkAgent("agent-real", [
+			{
+				type: "assistant",
+				agent_id: "agent-real",
+				run_id: "run-1",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "I will inspect the repository." }],
+				},
+			},
+			{
+				type: "tool_call",
+				agent_id: "agent-real",
+				run_id: "run-1",
+				call_id: "call-1",
+				name: "read",
+				args: { path: "README.md" },
+				status: "completed",
+				result: { content: "ok" },
+			},
+			{
+				type: "assistant",
+				agent_id: "agent-real",
+				run_id: "run-1",
+				message: { role: "assistant", content: [{ type: "text", text: diagnostic }] },
+			},
+		]);
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const result = await runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "inspect",
+		}).completed;
+
+		expect(result.stderr).toBe(diagnostic);
+		expect(result.resultEvent).toMatchObject({ subtype: "transport_error", is_error: true });
+	});
+
+	it("does not dispatch a prompt cancelled while agent creation is pending", async () => {
+		let resolveAgent: ((agent: ReturnType<typeof sdkAgent>) => void) | undefined;
+		const created = new Promise<ReturnType<typeof sdkAgent>>((resolve) => {
+			resolveAgent = resolve;
+		});
+		const agent = sdkAgent("agent-real");
+		sdkMocks.agentCreate.mockReturnValue(created);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		prompt.cancel();
+		resolveAgent?.(agent);
+		const result = await prompt.completed;
+
+		expect(agent.send).not.toHaveBeenCalled();
+		expect(result.resultEvent).toMatchObject({ subtype: "cancelled", is_error: false });
+	});
+
+	it("completes cancellation without waiting for stalled agent creation", async () => {
+		const agent = sdkAgent("agent-real");
+		let resolveAgent: ((agent: ReturnType<typeof sdkAgent>) => void) | undefined;
+		sdkMocks.agentCreate.mockReturnValue(
+			new Promise<ReturnType<typeof sdkAgent>>((resolve) => {
+				resolveAgent = resolve;
+			}),
+		);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		prompt.cancel();
+		const result = await prompt.completed;
+
+		expect(result.resultEvent).toMatchObject({ subtype: "cancelled", is_error: false });
+		resolveAgent?.(agent);
+		await vi.waitFor(() => expect(agent.close).toHaveBeenCalledOnce());
+		expect(agent.send).not.toHaveBeenCalled();
+	});
+
+	it("cancels a run that becomes available after cancellation", async () => {
+		let resolveSend: ((run: ReturnType<typeof sdkRun>) => void) | undefined;
+		const sendCompleted = new Promise<ReturnType<typeof sdkRun>>((resolve) => {
+			resolveSend = resolve;
+		});
+		const run = sdkRun();
+		const agent = {
+			agentId: "agent-real",
+			close: vi.fn(),
+			send: vi.fn(() => sendCompleted),
+		};
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+
+		await vi.waitFor(() => expect(agent.send).toHaveBeenCalledOnce());
+		prompt.cancel();
+		resolveSend?.(run);
+		const result = await prompt.completed;
+
+		expect(run.cancel).toHaveBeenCalledOnce();
+		expect(result.resultEvent).toMatchObject({ subtype: "cancelled", is_error: false });
+	});
+
+	it("retires an SDK agent when cancelled dispatch does not settle", async () => {
+		vi.useFakeTimers();
+		const agent = {
+			agentId: "agent-real",
+			close: vi.fn(),
+			send: vi.fn(() => new Promise<never>(() => {})),
+		};
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		while (agent.send.mock.calls.length === 0) {
+			await Promise.resolve();
+		}
+
+		prompt.cancel();
+		await vi.advanceTimersByTimeAsync(15_000);
+		const result = await prompt.completed;
+
+		expect(agent.close).toHaveBeenCalledOnce();
+		expect(result.resultEvent).toMatchObject({ subtype: "cancelled", is_error: false });
+	});
+
+	it("drains final SDK events after cancellation before completing", async () => {
+		let finishCancellation: (() => void) | undefined;
+		const cancellation = new Promise<void>((resolve) => {
+			finishCancellation = resolve;
+		});
+		let toolStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			toolStarted = resolve;
+		});
+		const run = {
+			cancel: vi.fn(async () => finishCancellation?.()),
+			async *stream() {
+				yield {
+					type: "tool_call",
+					agent_id: "agent-real",
+					run_id: "run-1",
+					call_id: "call-1",
+					name: "shell",
+					args: { command: "sleep 10" },
+					status: "running",
+				};
+				await cancellation;
+				yield {
+					type: "tool_call",
+					agent_id: "agent-real",
+					run_id: "run-1",
+					call_id: "call-1",
+					name: "shell",
+					args: { command: "sleep 10" },
+					status: "error",
+					result: { message: "Cancelled" },
+				};
+			},
+			wait: vi.fn(async () => ({ status: "cancelled" as const })),
+		};
+		const agent = {
+			agentId: "agent-real",
+			close: vi.fn(),
+			send: vi.fn(async () => run),
+		};
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+		const events: CursorStreamEvent[] = [];
+		const prompt = runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "wait",
+			onEvent: (event) => {
+				events.push(event);
+				if (event.type === "tool_call" && event.subtype === "started") {
+					toolStarted?.();
+				}
+			},
+		});
+
+		await started;
+		prompt.cancel();
+		const result = await prompt.completed;
+
+		expect(run.cancel).toHaveBeenCalledOnce();
+		expect(events.map((event) => [event.type, event.subtype])).toEqual(
+			expect.arrayContaining([
+				["tool_call", "completed"],
+				["result", "cancelled"],
+			]),
+		);
+		expect(result.resultEvent).toMatchObject({ subtype: "cancelled", is_error: false });
 	});
 });

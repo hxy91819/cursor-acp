@@ -258,6 +258,7 @@ function createAgentTestHarness(
 	const legacyPromptCalls: {
 		promptText: string;
 		backendSessionId?: string;
+		modelId?: string;
 		reviewPolicy?: RunPromptOptions["reviewPolicy"];
 		thinkingLevel?: string;
 		fastValue?: string;
@@ -283,6 +284,7 @@ function createAgentTestHarness(
 			legacyPromptCalls.push({
 				promptText: options.prompt,
 				backendSessionId: options.backendSessionId,
+				modelId: options.modelId,
 				reviewPolicy: options.reviewPolicy,
 				thinkingLevel: options.thinkingLevel,
 				fastValue: options.fastValue,
@@ -2442,7 +2444,10 @@ describe("CursorAcpAgent", () => {
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "second" }],
 			}),
-		).rejects.toThrow(/another prompt is in progress/);
+		).rejects.toMatchObject({
+			code: -32602,
+			message: expect.stringContaining("already in flight"),
+		});
 
 		resolvePrompt?.();
 		await first;
@@ -2511,23 +2516,25 @@ describe("CursorAcpAgent", () => {
 		expect(legacyPromptCalls).toHaveLength(1);
 	});
 
-	it("steer arriving before the SDK run waits for that run", async () => {
-		const { agent, steerCalls, setLegacyPromptHandler } = createAgentTestHarness({
-			supportsSteering: true,
-		});
+	it("prompt arriving before the SDK run queues behind it", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler } =
+			createAgentTestHarness({
+				supportsSteering: true,
+			});
 		await agent.initialize(initRequest());
 		const session = await agent.newSession(newSessionRequest());
-		let finishRun: (() => void) | undefined;
+		const finishRuns: Array<() => void> = [];
 		setLegacyPromptHandler(
 			async () =>
 				await new Promise((resolve) => {
-					finishRun = () =>
+					finishRuns.push(() =>
 						resolve({
 							events: [],
 							resultEvent: { type: "result", subtype: "success", is_error: false },
 							stderr: "",
 							exitCode: 0,
-						});
+						}),
+					);
 				}),
 		);
 		const primary = agent.prompt({
@@ -2538,8 +2545,12 @@ describe("CursorAcpAgent", () => {
 			sessionId: session.sessionId,
 			prompt: [{ type: "text", text: "early steer" }],
 		});
-		await vi.waitFor(() => expect(steerCalls).toEqual(["early steer"]));
-		finishRun?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		expect(steerCalls).toEqual([]);
+		finishRuns[0]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work", "early steer"]);
+		finishRuns[1]?.();
 		expect(await Promise.all([primary, steer])).toEqual([
 			{ stopReason: "end_turn" },
 			{ stopReason: "end_turn" },
@@ -2684,22 +2695,39 @@ describe("CursorAcpAgent", () => {
 		}
 	});
 
-	it("reverted steer returns a clear error without waiting for the run", async () => {
-		const { agent, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
-			createAgentTestHarness({ supportsSteering: true });
+	it("reverted steer runs as a new run after the current one", async () => {
+		const {
+			agent,
+			client,
+			legacyPromptCalls,
+			steerCalls,
+			setLegacyPromptHandler,
+			setSteerHandler,
+		} = createAgentTestHarness({ supportsSteering: true });
 		await agent.initialize(initRequest());
 		const session = await agent.newSession(newSessionRequest());
-		let finishRun: (() => void) | undefined;
+		const finishRuns: Array<() => void> = [];
 		setLegacyPromptHandler(
-			async () =>
+			async (text, { onEvent }) =>
 				await new Promise((resolve) => {
-					finishRun = () =>
-						resolve({
-							events: [],
-							resultEvent: { type: "result", subtype: "success", is_error: false },
-							stderr: "",
-							exitCode: 0,
-						});
+					finishRuns.push(() => {
+						void (async () => {
+							await onEvent?.({
+								type: "assistant",
+								message: { content: [{ type: "text", text: `reply to ${text}` }] },
+							});
+							resolve({
+								events: [],
+								resultEvent: {
+									type: "result",
+									subtype: "success",
+									is_error: false,
+								},
+								stderr: "",
+								exitCode: 0,
+							});
+						})();
+					});
 				}),
 		);
 		setSteerHandler(async () => "revert_to_followup");
@@ -2708,16 +2736,416 @@ describe("CursorAcpAgent", () => {
 			prompt: [{ type: "text", text: "work" }],
 		});
 		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
-		await expect(
+		let deferredSettled = false;
+		const deferred = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "too late" }],
+		});
+		void deferred.then(() => {
+			deferredSettled = true;
+		});
+		await vi.waitFor(() => expect(steerCalls).toEqual(["too late"]));
+		expect(legacyPromptCalls).toHaveLength(1);
+		expect(deferredSettled).toBe(false);
+		finishRuns[0]?.();
+		expect(await primary).toEqual({ stopReason: "end_turn" });
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work", "too late"]);
+		expect(legacyPromptCalls[1]?.backendSessionId).toBe(legacyPromptCalls[0]?.backendSessionId);
+		expect(deferredSettled).toBe(false);
+		finishRuns[1]?.();
+		expect(await deferred).toEqual({ stopReason: "end_turn" });
+		expect(steerCalls).toEqual(["too late"]);
+		expect(
+			client.updates
+				.filter((item) => item.update.sessionUpdate === "agent_message_chunk")
+				.map((item) =>
+					item.update.sessionUpdate === "agent_message_chunk" &&
+					item.update.content.type === "text"
+						? item.update.content.text
+						: "",
+				),
+		).toEqual(["reply to work", "reply to too late"]);
+	});
+
+	it("prompts after a deferred input queue behind it", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		setSteerHandler(async () => "revert_to_followup");
+		const completed: string[] = [];
+		const send = (text: string) => {
+			const result = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text }],
+			});
+			void result.then(() => completed.push(text));
+			return result;
+		};
+		const primary = send("work");
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const first = send("first deferred");
+		await vi.waitFor(() => expect(steerCalls).toEqual(["first deferred"]));
+		const second = send("second deferred");
+		const third = send("third deferred");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(steerCalls).toEqual(["first deferred"]);
+		finishRuns[0]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(completed).toEqual(["work"]);
+		finishRuns[1]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		expect(completed).toEqual(["work", "first deferred"]);
+		finishRuns[2]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(4));
+		expect(completed).toEqual(["work", "first deferred", "second deferred"]);
+		finishRuns[3]?.();
+		expect(await Promise.all([primary, first, second, third])).toEqual(
+			Array(4).fill({ stopReason: "end_turn" }),
+		);
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+			"work",
+			"first deferred",
+			"second deferred",
+			"third deferred",
+		]);
+		expect(steerCalls).toEqual(["first deferred"]);
+	});
+
+	it("pending steer keeps arrival order when the run ends first", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		let returnSteer: (() => void) | undefined;
+		setSteerHandler(
+			async () =>
+				await new Promise((resolve) => {
+					returnSteer = () => resolve("revert_to_followup");
+				}),
+		);
+		const send = (text: string) =>
 			agent.prompt({
 				sessionId: session.sessionId,
-				prompt: [{ type: "text", text: "too late" }],
-			}),
-		).rejects.toThrow(
-			/Steer was returned at the end of the turn; deferred follow-up is not yet supported/,
+				prompt: [{ type: "text", text }],
+			});
+		const primary = send("work");
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const earlier = send("earlier");
+		await vi.waitFor(() => expect(steerCalls).toEqual(["earlier"]));
+		finishRuns[0]?.();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const later = send("later");
+		returnSteer?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work", "earlier"]);
+		finishRuns[1]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+			"work",
+			"earlier",
+			"later",
+		]);
+		finishRuns[2]?.();
+		expect(await Promise.all([primary, earlier, later])).toEqual(
+			Array(3).fill({ stopReason: "end_turn" }),
 		);
+		expect(steerCalls).toEqual(["earlier"]);
+	});
+
+	it("failed run still drains a pending steer before its queued prompts", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let failRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((_resolve, reject) => {
+					failRun = () => reject(new Error("transport failure"));
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		let returnSteer: (() => void) | undefined;
+		setSteerHandler(
+			async () =>
+				await new Promise((resolve) => {
+					returnSteer = () => resolve("revert_to_followup");
+				}),
+		);
+		const send = (text: string) =>
+			agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text }],
+			});
+		const primary = send("work");
+		void primary.catch(() => undefined);
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const earlier = send("earlier");
+		await vi.waitFor(() => expect(steerCalls).toEqual(["earlier"]));
+		failRun?.();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const later = send("later");
+		returnSteer?.();
+		await expect(primary).rejects.toThrow(/transport failure/);
+		expect((await Promise.all([earlier, later])).map((item) => item.stopReason)).toEqual([
+			"end_turn",
+			"end_turn",
+		]);
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+			"work",
+			"earlier",
+			"later",
+		]);
+		expect(steerCalls).toEqual(["earlier"]);
+	});
+
+	it("cancel settles deferred and queued prompts without starting more runs", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		setSteerHandler(async () => "revert_to_followup");
+		const send = (text: string) =>
+			agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text }],
+			});
+		const primary = send("work");
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const deferred = send("deferred");
+		await vi.waitFor(() => expect(steerCalls).toEqual(["deferred"]));
+		const queued = send("queued");
+		await agent.cancel({ sessionId: session.sessionId });
 		finishRun?.();
-		await primary;
+		expect(await Promise.all([primary, deferred, queued])).toEqual(
+			Array(3).fill({ stopReason: "cancelled" }),
+		);
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work"]);
+		expect(await send("next turn")).toEqual({ stopReason: "end_turn" });
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work", "next turn"]);
+	});
+
+	it("slash prompt waits behind a deferred input", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		let returnSteer: (() => void) | undefined;
+		setSteerHandler(
+			async () =>
+				await new Promise((resolve) => {
+					returnSteer = () => resolve("revert_to_followup");
+				}),
+		);
+		const send = (text: string) =>
+			agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text }],
+			});
+		const primary = send("work");
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const deferred = send("deferred");
+		await vi.waitFor(() => expect(steerCalls).toEqual(["deferred"]));
+		let commandSettled = false;
+		const command = send("/model gpt-5.2");
+		void command.then(() => {
+			commandSettled = true;
+		});
+		expect(commandSettled).toBe(false);
+		finishRuns[0]?.();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		returnSteer?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(legacyPromptCalls[1]?.modelId).toBe(legacyPromptCalls[0]?.modelId);
+		expect(commandSettled).toBe(false);
+		finishRuns[1]?.();
+		expect(
+			(await Promise.all([primary, deferred, command])).map((item) => item.stopReason),
+		).toEqual(["end_turn", "end_turn", "end_turn"]);
+		const after = send("after command");
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		expect(legacyPromptCalls[2]?.modelId).toBe("gpt-5.2");
+		finishRuns[2]?.();
+		await after;
+		expect(steerCalls).toEqual(["deferred"]);
+	});
+
+	it("steer paths never return the busy error", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		setSteerHandler(async () => "revert_to_followup");
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const returned = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "returned" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const queued = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "queued" }],
+		});
+		finishRuns[0]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		finishRuns[1]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		finishRuns[2]?.();
+		expect(await Promise.all([primary, returned, queued])).toEqual(
+			Array(3).fill({ stopReason: "end_turn" }),
+		);
+	});
+
+	it("prompt during permission retry gap queues for a later run", async () => {
+		const { agent, client, legacyPromptCalls, steerCalls, setLegacyPromptHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest({ modeId: "auto-review" }));
+		let allowPermission: (() => void) | undefined;
+		client.requestPermission = async (params) => {
+			client.permissionCalls.push(params);
+			await new Promise<void>((resolve) => {
+				allowPermission = resolve;
+			});
+			return { outcome: { outcome: "selected", optionId: "allow_once" } };
+		};
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(async (_text, { onEvent }) => {
+			if (legacyPromptCalls.length === 1) {
+				await onEvent?.({
+					type: "tool_call",
+					subtype: "completed",
+					call_id: "t1",
+					tool_call: {
+						shellToolCall: {
+							args: { command: "pwd" },
+							result: { rejected: { command: "pwd", reason: "blocked" } },
+						},
+					},
+				});
+				return {
+					events: [],
+					resultEvent: { type: "result", subtype: "success", is_error: false },
+					stderr: "",
+					exitCode: 0,
+				};
+			}
+			return await new Promise((resolve) => {
+				finishRuns.push(() =>
+					resolve({
+						events: [],
+						resultEvent: { type: "result", subtype: "success", is_error: false },
+						stderr: "",
+						exitCode: 0,
+					}),
+				);
+			});
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(client.permissionCalls).toHaveLength(1));
+		const gapPrompt = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "during approval" }],
+		});
+		expect(steerCalls).toEqual([]);
+		allowPermission?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		finishRuns[0]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		finishRuns[1]?.();
+		expect(
+			(await Promise.all([primary, gapPrompt])).map((response) => response.stopReason),
+		).toEqual(["end_turn", "end_turn"]);
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+			"work",
+			"work",
+			"during approval",
+		]);
 	});
 
 	it("rejects model changes while a prompt is active", async () => {

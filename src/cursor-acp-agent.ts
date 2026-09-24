@@ -465,6 +465,12 @@ interface PromptAttemptResult {
 	rejectedToolCalls: RejectedToolCall[];
 }
 
+interface PendingPrompt {
+	params: PromptRequest;
+	resolve: (response: PromptResponse) => void;
+	reject: (error: unknown) => void;
+}
+
 export interface SessionState {
 	sessionId: string;
 	cwd: string;
@@ -481,9 +487,8 @@ export interface SessionState {
 	activePrompt?: ActivePromptState;
 	activeRun?: ActiveRunState;
 	activeTurn?: Promise<PromptResponse>;
-	activeRunReady?: Promise<CursorPromptRun>;
-	resolveActiveRun?: (run: CursorPromptRun) => void;
-	rejectActiveRun?: (error: Error) => void;
+	processingPrompts?: boolean;
+	pendingPrompts?: PendingPrompt[];
 	steerQueue?: Promise<void>;
 	backendSessionId?: string;
 	/** Populated from native `session/new` or `session/load` when available. */
@@ -772,117 +777,122 @@ export class CursorAcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const session = this.requireSession(params.sessionId);
-		let promptText = promptToCursorText(params);
-		const promptImages = promptToCursorImages(params);
+		if (session.processingPrompts) {
+			if (session.cancelled) {
+				return { stopReason: "cancelled" };
+			}
+			const promptText = promptToCursorText(params);
+			const slash = parseLeadingSlashCommand(promptText);
+			if (!session.activeTurn) {
+				return session.steerQueue
+					? await this.steerPrompt(session, params, promptText, false)
+					: await this.queuePrompt(session, params);
+			}
+			if (!this.runner.supportsMidTurnSteering) {
+				throw RequestError.invalidParams(undefined, "A prompt is already in flight");
+			}
+			if (slash.hasSlash) {
+				return session.steerQueue
+					? await this.queueAfterSteers(session, params)
+					: await this.queuePrompt(session, params);
+			}
+			if (!session.steerQueue && (session.pendingPrompts?.length || !session.activeRun)) {
+				return await this.queuePrompt(session, params);
+			}
+			return await this.steerPrompt(
+				session,
+				params,
+				promptText,
+				params.prompt.every((block) => block.type === "text"),
+			);
+		}
+		session.cancelled = false;
+		session.processingPrompts = true;
+		const primary = this.queuePrompt(session, params);
+		void this.processPromptQueue(session);
+		return await primary;
+	}
 
-		const slash = parseLeadingSlashCommand(promptText);
-		if (slash.hasSlash) {
-			if (!this.hasNativeSlashCommand(session, slash.command)) {
-				const handled = await handleSlashCommand(slash.command, slash.args, {
-					session,
-					auth: this.auth,
-					listModels: async () => await this.runner.listModels(),
-					availableCommands: this.availableCommandsForSession(session),
-					onModeChanged: async (modeId) => {
-						await this.applySessionMode(session, modeId);
-					},
-					onModelChanged: async (modelId) => {
-						session.modelId = modelId;
-						session.configuredModelId = modelId;
-						this.syncModelParameters(session);
-						await this.applyNativeModelIfConnected(session);
-						await this.persistSessionMeta(session);
-					},
-				});
+	private queuePrompt(session: SessionState, params: PromptRequest): Promise<PromptResponse> {
+		if (session.cancelled) {
+			return Promise.resolve({ stopReason: "cancelled" });
+		}
+		return new Promise((resolve, reject) => {
+			(session.pendingPrompts ??= []).push({ params, resolve, reject });
+		});
+	}
 
-				if (handled.handled) {
-					if (session.cancelled) {
-						return { stopReason: "cancelled" };
-					}
+	private async queueAfterSteers(
+		session: SessionState,
+		params: PromptRequest,
+	): Promise<PromptResponse> {
+		const admission = (session.steerQueue ?? Promise.resolve()).then(() => ({
+			response: this.queuePrompt(session, params),
+		}));
+		session.steerQueue = admission.then(
+			() => undefined,
+			() => undefined,
+		);
+		return await (
+			await admission
+		).response;
+	}
 
-					if (handled.responseText) {
-						await this.client.sessionUpdate({
-							sessionId: session.sessionId,
-							update: {
-								sessionUpdate: "agent_message_chunk",
-								content: {
-									type: "text",
-									text: handled.responseText,
-								},
-							},
-						});
-						await recordAssistantMessage(
-							session.cwd,
-							session.sessionId,
-							handled.responseText,
-						);
-					}
-
-					return { stopReason: "end_turn" };
+	private async processPromptQueue(session: SessionState): Promise<void> {
+		try {
+			while (true) {
+				await this.drainSteerQueue(session);
+				const prompt = session.pendingPrompts?.shift();
+				if (!prompt) {
+					break;
 				}
-
-				const customPrompt =
-					resolveCustomSlashCommandPrompt(
-						slash.command,
-						slash.args,
-						session.customSlashCommands,
-					) ?? resolveSkillSlashCommandPrompt(slash.command, session.customSkills);
-				if (customPrompt) {
-					promptText = customPrompt;
+				const turn = this.executePrimaryPrompt(session, prompt.params);
+				session.activeTurn = turn;
+				try {
+					prompt.resolve(await turn);
+				} catch (error) {
+					prompt.reject(error);
+				} finally {
+					session.activeTurn = undefined;
 				}
+			}
+		} finally {
+			session.processingPrompts = false;
+			session.steerQueue = undefined;
+		}
+	}
+
+	private async drainSteerQueue(session: SessionState): Promise<void> {
+		while (session.steerQueue) {
+			const pending = session.steerQueue;
+			await pending;
+			if (session.steerQueue === pending) {
+				return;
 			}
 		}
+	}
 
-		if (session.activeTurn) {
-			if (!this.runner.supportsMidTurnSteering) {
-				throw RequestError.invalidParams(
-					undefined,
-					"Cannot send a prompt while another prompt is in progress",
-				);
+	private async steerPrompt(
+		session: SessionState,
+		params: PromptRequest,
+		text: string,
+		canSteer: boolean,
+	): Promise<PromptResponse> {
+		const delivery = (session.steerQueue ?? Promise.resolve()).then(async () => {
+			if (session.cancelled) {
+				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
 			}
-			if (slash.hasSlash || params.prompt.some((block) => block.type !== "text")) {
+			// A preceding steer may have been returned while this one waited its turn.
+			if (session.pendingPrompts?.length || !session.activeRun) {
+				return { response: this.queuePrompt(session, params) };
+			}
+			if (!canSteer) {
 				throw RequestError.internalError(
 					undefined,
 					"This input cannot be steered during the current Cursor turn",
 				);
 			}
-			return await this.steerPrompt(session, promptText);
-		}
-
-		session.activeRunReady = new Promise<CursorPromptRun>((resolve, reject) => {
-			session.resolveActiveRun = resolve;
-			session.rejectActiveRun = reject;
-		});
-		void session.activeRunReady.catch(() => undefined);
-		const primary = this.runPrimaryPrompt(session, promptText, promptImages);
-		session.activeTurn = primary;
-		try {
-			return await primary;
-		} finally {
-			session.rejectActiveRun?.(
-				new Error("Cursor turn ended before a run was ready for steering"),
-			);
-			session.activeTurn = undefined;
-			session.activeRunReady = undefined;
-			session.resolveActiveRun = undefined;
-			session.rejectActiveRun = undefined;
-			session.steerQueue = undefined;
-		}
-	}
-
-	private async steerPrompt(session: SessionState, text: string): Promise<PromptResponse> {
-		const turn = session.activeTurn!;
-		const runReady = session.activeRun
-			? Promise.resolve(session.activeRun)
-			: session.activeRunReady;
-		if (!runReady) {
-			throw RequestError.internalError(
-				undefined,
-				"Cursor turn has no active run available for steering",
-			);
-		}
-		const delivery = (session.steerQueue ?? Promise.resolve()).then(async () => {
-			const run = await runReady;
+			const run = session.activeRun;
 			if (!run.steer) {
 				throw RequestError.internalError(
 					undefined,
@@ -890,23 +900,79 @@ export class CursorAcpAgent implements Agent {
 				);
 			}
 			const outcome = await run.steer(text);
+			if (session.cancelled) {
+				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
+			}
 			if (outcome === "complete_delivered") {
 				await recordUserMessage(session.cwd, session.sessionId, text);
+				return { response: session.activeTurn! };
 			}
-			return outcome;
+			return { response: this.queuePrompt(session, params) };
 		});
 		session.steerQueue = delivery.then(
 			() => undefined,
 			() => undefined,
 		);
-		const outcome = await delivery;
-		if (outcome === "revert_to_followup") {
-			throw RequestError.internalError(
-				undefined,
-				"Steer was returned at the end of the turn; deferred follow-up is not yet supported",
-			);
+		return await (
+			await delivery
+		).response;
+	}
+
+	private async executePrimaryPrompt(
+		session: SessionState,
+		params: PromptRequest,
+	): Promise<PromptResponse> {
+		let promptText = promptToCursorText(params);
+		const promptImages = promptToCursorImages(params);
+		const slash = parseLeadingSlashCommand(promptText);
+		if (slash.hasSlash && !this.hasNativeSlashCommand(session, slash.command)) {
+			const handled = await handleSlashCommand(slash.command, slash.args, {
+				session,
+				auth: this.auth,
+				listModels: async () => await this.runner.listModels(),
+				availableCommands: this.availableCommandsForSession(session),
+				onModeChanged: async (modeId) => {
+					await this.applySessionMode(session, modeId);
+				},
+				onModelChanged: async (modelId) => {
+					session.modelId = modelId;
+					session.configuredModelId = modelId;
+					this.syncModelParameters(session);
+					await this.applyNativeModelIfConnected(session);
+					await this.persistSessionMeta(session);
+				},
+			});
+			if (handled.handled) {
+				if (session.cancelled) {
+					return { stopReason: "cancelled" };
+				}
+				if (handled.responseText) {
+					await this.client.sessionUpdate({
+						sessionId: session.sessionId,
+						update: {
+							sessionUpdate: "agent_message_chunk",
+							content: { type: "text", text: handled.responseText },
+						},
+					});
+					await recordAssistantMessage(
+						session.cwd,
+						session.sessionId,
+						handled.responseText,
+					);
+				}
+				return { stopReason: "end_turn" };
+			}
+			const customPrompt =
+				resolveCustomSlashCommandPrompt(
+					slash.command,
+					slash.args,
+					session.customSlashCommands,
+				) ?? resolveSkillSlashCommandPrompt(slash.command, session.customSkills);
+			if (customPrompt) {
+				promptText = customPrompt;
+			}
 		}
-		return await turn;
+		return await this.runPrimaryPrompt(session, promptText, promptImages);
 	}
 
 	private async runPrimaryPrompt(
@@ -918,16 +984,18 @@ export class CursorAcpAgent implements Agent {
 		if (!status.loggedIn) {
 			throw RequestError.authRequired();
 		}
-
-		if (session.activePrompt || session.activeRun) {
-			throw RequestError.invalidParams(
-				undefined,
-				"Cannot send a prompt while another prompt is in progress",
-			);
+		if (session.cancelled) {
+			return { stopReason: "cancelled" };
 		}
 
-		session.cancelled = false;
+		if (session.activePrompt || session.activeRun) {
+			throw RequestError.invalidParams(undefined, "A prompt is already in flight");
+		}
+
 		await recordUserMessage(session.cwd, session.sessionId, promptText);
+		if (session.cancelled) {
+			return { stopReason: "cancelled" };
+		}
 		const firstAttempt = await this.runPromptAttempt(session, promptText, promptImages, false);
 
 		if (firstAttempt.stopReason === "cancelled" || session.cancelled) {
@@ -971,6 +1039,9 @@ export class CursorAcpAgent implements Agent {
 	async cancel(params: CancelNotification): Promise<void> {
 		const session = this.requireSession(params.sessionId);
 		session.cancelled = true;
+		for (const prompt of session.pendingPrompts?.splice(0) ?? []) {
+			prompt.resolve({ stopReason: "cancelled" });
+		}
 		session.activeRun?.cancel();
 		await session.nativeClient?.cancel();
 	}
@@ -1999,6 +2070,9 @@ export class CursorAcpAgent implements Agent {
 		const assistantTextChunks: string[] = [];
 
 		await this.ensureLegacyBackendSessionId(session);
+		if (session.cancelled) {
+			return { stopReason: "cancelled", rejectedToolCalls };
+		}
 
 		const run = this.runner.startPrompt({
 			workspace: session.cwd,
@@ -2049,14 +2123,12 @@ export class CursorAcpAgent implements Agent {
 		});
 
 		session.activeRun = run;
-		session.resolveActiveRun?.(run);
 
 		try {
 			const completed = await run.completed;
 			session.activeRun = undefined;
-			session.activeRunReady = undefined;
 			// A delivered steer belongs before this run's assistant reply in replay history.
-			await session.steerQueue;
+			await this.drainSteerQueue(session);
 
 			if (session.cancelled) {
 				return {
@@ -2106,7 +2178,7 @@ export class CursorAcpAgent implements Agent {
 			throw RequestError.internalError(undefined, resultText || "Cursor failed");
 		} catch (error) {
 			session.activeRun = undefined;
-			session.activeRunReady = undefined;
+			await this.drainSteerQueue(session);
 			if (session.cancelled) {
 				return {
 					stopReason: "cancelled",

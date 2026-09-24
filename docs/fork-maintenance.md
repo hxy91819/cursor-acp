@@ -102,7 +102,7 @@ nub run build    # tsc，产物到 dist/
 
 ### 本机（/data/code/cursor-acp）
 
-BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全局 `npm link`——"聚合在哪、BB 用的就是哪份"一目了然：
+BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全局 `npm link`——"聚合在哪、BB 用的就是哪份"一目了然。`nativeSkillRoots` 必须对齐 BB 内置 `acp-cursor` 的四族根（`recursive`，project 侧加 `ancestors`），只写 `.cursor/skills` 会让 BB 的技能自动发现扫不到东西：
 
 ```json
 {
@@ -113,7 +113,20 @@ BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全�
       "command": "node",
       "args": ["/data/code/cursor-acp/dist/index.js"],
       "steeringMode": "auto",
-      "nativeSkillRoots": { "user": [".cursor/skills"], "project": [".cursor/skills"] }
+      "nativeSkillRoots": {
+        "user": [
+          {"path": ".cursor/skills", "recursive": true},
+          {"path": ".agents/skills", "recursive": true},
+          {"path": ".claude/skills", "recursive": true, "skipIfManifest": ".claude-plugin/plugin.json"},
+          {"path": ".codex/skills", "recursive": true}
+        ],
+        "project": [
+          {"path": ".cursor/skills", "recursive": true, "ancestors": true},
+          {"path": ".agents/skills", "recursive": true, "ancestors": true},
+          {"path": ".claude/skills", "recursive": true, "ancestors": true, "skipIfManifest": ".claude-plugin/plugin.json"},
+          {"path": ".codex/skills", "recursive": true, "ancestors": true}
+        ]
+      }
     }
   ]
 }

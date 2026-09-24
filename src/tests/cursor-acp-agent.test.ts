@@ -2475,6 +2475,24 @@ describe("CursorAcpAgent", () => {
 		expect((await unsupported.agent.initialize(initRequest()))._meta).toBeUndefined();
 	});
 
+	it("idle primary prompt preserves SDK image input", async () => {
+		const { agent, legacyPromptCalls } = createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [
+				{ type: "text", text: "describe this" },
+				{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" },
+			],
+		});
+		expect(legacyPromptCalls[0]?.promptText).toContain("describe this");
+		expect(legacyPromptCalls[0]?.images).toEqual([
+			{ data: PNG_STEER_ATTACHMENT, mimeType: "image/png" },
+		]);
+		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
+	});
+
 	it("stacked steers are delivered in arrival order", async () => {
 		const harness = createAgentTestHarness({ supportsSteering: true });
 		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
@@ -2610,6 +2628,183 @@ describe("CursorAcpAgent", () => {
 		]);
 	});
 
+	it("steer does not cancel a pending permission request", async () => {
+		const { agent, client, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness(
+			{ supportsSteering: true },
+		);
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let answerPermission: (() => void) | undefined;
+		let permissionAnswered = false;
+		vi.spyOn(client, "requestPermission").mockImplementation(async (request) => {
+			client.permissionCalls.push(request);
+			await new Promise<void>((resolve) => {
+				answerPermission = resolve;
+			});
+			permissionAnswered = true;
+			return { outcome: { outcome: "selected", optionId: "allow_once" } };
+		});
+		setLegacyPromptHandler(async (_text, { onEvent }) => {
+			if (legacyPromptCalls.length === 1) {
+				await onEvent?.({
+					type: "tool_call",
+					subtype: "completed",
+					call_id: "approval-1",
+					tool_call: {
+						shellToolCall: {
+							args: { command: "pwd" },
+							result: { rejected: { command: "pwd", reason: "needs approval" } },
+						},
+					},
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "run pwd" }],
+		});
+		await vi.waitFor(() => expect(client.permissionCalls).toHaveLength(1));
+		let steerSettled = false;
+		const steer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "also report cwd" }],
+		});
+		void steer.then(() => {
+			steerSettled = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(permissionAnswered).toBe(false);
+		expect(steerSettled).toBe(false);
+		expect(client.permissionCalls).toHaveLength(1);
+		answerPermission?.();
+		expect(
+			(await Promise.all([primary, steer])).map((response) => response.stopReason),
+		).toEqual(["end_turn", "end_turn"]);
+		expect(permissionAnswered).toBe(true);
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+			"run pwd",
+			"run pwd",
+			"also report cwd",
+		]);
+	});
+
+	it("permission retry replays delivered steers", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishFirst: (() => void) | undefined;
+		setLegacyPromptHandler(async (_text, { onEvent }) => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishFirst = resolve;
+				});
+				await onEvent?.({
+					type: "tool_call",
+					subtype: "completed",
+					call_id: "approval-1",
+					tool_call: {
+						shellToolCall: {
+							args: { command: "pwd" },
+							result: { rejected: { command: "pwd", reason: "needs approval" } },
+						},
+					},
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "run pwd" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const first = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "first adjustment" }],
+		});
+		const second = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "second adjustment" }],
+		});
+		await vi.waitFor(() =>
+			expect(steerCalls).toEqual(["first adjustment", "second adjustment"]),
+		);
+		finishFirst?.();
+		expect(
+			(await Promise.all([primary, first, second])).map((response) => response.stopReason),
+		).toEqual(Array(3).fill("end_turn"));
+		expect(legacyPromptCalls.map((call) => [call.promptText, call.reviewPolicy])).toEqual([
+			["run pwd", "auto-review"],
+			["run pwd\n\nfirst adjustment\n\nsecond adjustment", "run-everything"],
+		]);
+	});
+
+	it("cancel settles an unresolved steer delivery as cancelled", async () => {
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		let finishDelivery: (() => void) | undefined;
+		setSteerHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishDelivery = () => resolve("revert_to_followup");
+				}),
+		);
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const pending = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "pending" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toEqual(["pending"]));
+		const deferred = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "deferred" }],
+		});
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await Promise.all([primary, pending, deferred])).toEqual(
+			Array(3).fill({ stopReason: "cancelled" }),
+		);
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work"]);
+		finishDelivery?.();
+		finishRun?.();
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["work", "next turn"]);
+	});
+
 	it("delivered steer is visible when the session resumes", async () => {
 		const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-steer-history-"));
 		process.env.CURSOR_ACP_CONFIG_DIR = tempRoot;
@@ -2675,6 +2870,22 @@ describe("CursorAcpAgent", () => {
 			expect(primarySettled).toBe(false);
 			deliverSteer?.();
 			await Promise.all([primary, steer]);
+			setSteerHandler(async () => "revert_to_followup");
+			const secondPrimary = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "second work" }],
+			});
+			await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+			const deferred = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "later" }],
+			});
+			await vi.waitFor(() => expect(steerCalls).toEqual(["adjust", "later"]));
+			finishRun?.();
+			await secondPrimary;
+			await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+			finishRun?.();
+			await deferred;
 
 			const resumed = createAgentTestHarness({ supportsSteering: true });
 			await resumed.agent.initialize(initRequest());
@@ -2699,6 +2910,10 @@ describe("CursorAcpAgent", () => {
 			).toEqual([
 				"user_message_chunk:work",
 				"user_message_chunk:adjust",
+				"agent_message_chunk:done",
+				"user_message_chunk:second work",
+				"agent_message_chunk:done",
+				"user_message_chunk:later",
 				"agent_message_chunk:done",
 			]);
 		} finally {
@@ -2947,7 +3162,7 @@ describe("CursorAcpAgent", () => {
 		expect(steerCalls).toEqual(["earlier"]);
 	});
 
-	it("cancel settles deferred and queued prompts without starting more runs", async () => {
+	it("cancel settles pending and deferred prompts as cancelled", async () => {
 		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
 			createAgentTestHarness({ supportsSteering: true });
 		await agent.initialize(initRequest());
@@ -2974,10 +3189,20 @@ describe("CursorAcpAgent", () => {
 			});
 		const primary = send("work");
 		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
-		const deferred = send("deferred");
-		await vi.waitFor(() => expect(steerCalls).toEqual(["deferred"]));
+		const deferred = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [
+				{ type: "text", text: "deferred" },
+				{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" },
+			],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		const filePath = /\[attachment: (.+?) \(MIME: image\/png\)/.exec(steerCalls[0]!)?.[1] ?? "";
+		expect(existsSync(filePath)).toBe(true);
 		const queued = send("queued");
 		await agent.cancel({ sessionId: session.sessionId });
+		expect(existsSync(filePath)).toBe(false);
+		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
 		finishRun?.();
 		expect(await Promise.all([primary, deferred, queued])).toEqual(
 			Array(3).fill({ stopReason: "cancelled" }),
@@ -3438,11 +3663,34 @@ describe("CursorAcpAgent", () => {
 		const secondSteer = agent.prompt({ sessionId: session.sessionId, prompt: manyImages });
 		releaseFirstSteer?.();
 		await new Promise((resolve) => setTimeout(resolve, 10));
-		await agent.cancel({ sessionId: session.sessionId });
+		const cancelling = agent.cancel({ sessionId: session.sessionId });
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		await cancelling;
+		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
+		const oldSteerCallCount = steerCalls.length;
 		finishRuns[0]?.();
 		expect(await primary).toEqual({ stopReason: "cancelled" });
 		expect(await secondSteer).toEqual({ stopReason: "cancelled" });
-		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		const nextSteer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(oldSteerCallCount + 1));
+		const filePath =
+			/\[attachment: (.+?) \(MIME: image\/png\)/.exec(
+				steerCalls[steerCalls.length - 1]!,
+			)?.[1] ?? "";
+		expect(existsSync(filePath)).toBe(true);
+		finishRuns[1]?.();
+		expect((await Promise.all([next, nextSteer])).map((item) => item.stopReason)).toEqual([
+			"end_turn",
+			"end_turn",
+		]);
+		expect(existsSync(filePath)).toBe(true);
 	});
 
 	it("prompt during permission retry gap queues for a later run", async () => {

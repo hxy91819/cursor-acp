@@ -497,8 +497,16 @@ export interface SessionState {
 	activeRun?: ActiveRunState;
 	activeTurn?: Promise<PromptResponse>;
 	processingPrompts?: boolean;
+	turnDrain?: Promise<void>;
+	resolveTurnDrain?: () => void;
 	pendingPrompts?: PendingPrompt[];
 	steerQueue?: Promise<void>;
+	steerConversions?: Set<Promise<SteerPromptText>>;
+	cancelResponse?: Promise<PromptResponse>;
+	resolveCancel?: (response: PromptResponse) => void;
+	cancelCleanup?: Promise<void>;
+	cancelEpoch?: number;
+	deliveredSteers?: string[];
 	backendSessionId?: string;
 	/** Populated from native `session/new` or `session/load` when available. */
 	nativeSessionModels?: LegacySessionModels;
@@ -788,37 +796,62 @@ export class CursorAcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const session = this.requireSession(params.sessionId);
+		if (!session.processingPrompts && session.cancelled && session.cancelCleanup) {
+			await session.cancelCleanup;
+		}
 		if (session.processingPrompts) {
 			if (session.cancelled) {
-				return { stopReason: "cancelled" };
+				// A prompt submitted after cancellation belongs to the next turn.
+				// Wait until the old SDK run and attachment cleanup are isolated.
+				await session.turnDrain;
+				return await this.prompt(params);
 			}
 			const promptText = promptToCursorText(params);
 			const slash = parseLeadingSlashCommand(promptText);
 			if (!session.activeTurn) {
-				return session.steerQueue
-					? await this.steerPrompt(session, params, false)
-					: await this.queuePrompt(session, params);
+				return await Promise.race([
+					session.steerQueue
+						? this.steerPrompt(session, params, false)
+						: this.queuePrompt(session, params),
+					session.cancelResponse!,
+				]);
 			}
 			if (!this.runner.supportsMidTurnSteering) {
 				throw RequestError.invalidParams(undefined, "A prompt is already in flight");
 			}
 			if (slash.hasSlash) {
-				return session.steerQueue
-					? await this.queueAfterSteers(session, params)
-					: await this.queuePrompt(session, params);
+				return await Promise.race([
+					session.steerQueue
+						? this.queueAfterSteers(session, params)
+						: this.queuePrompt(session, params),
+					session.cancelResponse!,
+				]);
 			}
 			if (!session.steerQueue && (session.pendingPrompts?.length || !session.activeRun)) {
-				return await this.queuePrompt(session, params);
+				return await Promise.race([
+					this.queuePrompt(session, params),
+					session.cancelResponse!,
+				]);
 			}
 			// Any mid-turn input can be steered: non-text blocks are converted to
 			// temp-file references before the text is handed to the SDK run.
-			return await this.steerPrompt(session, params, true);
+			return await Promise.race([
+				this.steerPrompt(session, params, true),
+				session.cancelResponse!,
+			]);
 		}
 		session.cancelled = false;
+		session.cancelCleanup = undefined;
+		session.cancelResponse = new Promise((resolve) => {
+			session.resolveCancel = resolve;
+		});
 		session.processingPrompts = true;
+		session.turnDrain = new Promise((resolve) => {
+			session.resolveTurnDrain = resolve;
+		});
 		const primary = this.queuePrompt(session, params);
 		void this.processPromptQueue(session);
-		return await primary;
+		return await Promise.race([primary, session.cancelResponse]);
 	}
 
 	private queuePrompt(
@@ -838,8 +871,12 @@ export class CursorAcpAgent implements Agent {
 		session: SessionState,
 		params: PromptRequest,
 	): Promise<PromptResponse> {
+		const cancelEpoch = session.cancelEpoch ?? 0;
 		const admission = (session.steerQueue ?? Promise.resolve()).then(() => ({
-			response: this.queuePrompt(session, params),
+			response:
+				(session.cancelEpoch ?? 0) === cancelEpoch
+					? this.queuePrompt(session, params)
+					: Promise.resolve({ stopReason: "cancelled" as const }),
 		}));
 		session.steerQueue = admission.then(
 			() => undefined,
@@ -869,15 +906,22 @@ export class CursorAcpAgent implements Agent {
 				}
 			}
 		} finally {
+			if (session.cancelled) {
+				await session.cancelCleanup;
+			}
 			session.processingPrompts = false;
 			session.steerQueue = undefined;
+			session.resolveTurnDrain?.();
 		}
 	}
 
 	private async drainSteerQueue(session: SessionState): Promise<void> {
 		while (session.steerQueue) {
 			const pending = session.steerQueue;
-			await pending;
+			await Promise.race([pending, session.cancelResponse!]);
+			if (session.cancelled) {
+				return;
+			}
 			if (session.steerQueue === pending) {
 				return;
 			}
@@ -889,8 +933,9 @@ export class CursorAcpAgent implements Agent {
 		params: PromptRequest,
 		canSteer: boolean,
 	): Promise<PromptResponse> {
+		const cancelEpoch = session.cancelEpoch ?? 0;
 		const delivery = (session.steerQueue ?? Promise.resolve()).then(async () => {
-			if (session.cancelled) {
+			if (session.cancelled || (session.cancelEpoch ?? 0) !== cancelEpoch) {
 				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
 			}
 			// Non-text blocks are written to per-session temp files and replaced by
@@ -898,10 +943,11 @@ export class CursorAcpAgent implements Agent {
 			// end up deferred run with the same text they would have been injected
 			// with, so the agent sees identical content either way.
 			const steerText = await this.resolveSteerText(session, params);
-			if (steerText === null || session.cancelled) {
-				// Cancel raced or followed the attachment writes and may have had
-				// its cleanup undone by files recreating the session directory.
-				await cleanupSessionSteerAttachments(session.sessionId);
+			if (
+				steerText === null ||
+				session.cancelled ||
+				(session.cancelEpoch ?? 0) !== cancelEpoch
+			) {
 				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
 			}
 			// A preceding steer may have been returned while this one waited its
@@ -925,10 +971,11 @@ export class CursorAcpAgent implements Agent {
 				);
 			}
 			const outcome = await run.steer(steerText.text);
-			if (session.cancelled) {
+			if (session.cancelled || (session.cancelEpoch ?? 0) !== cancelEpoch) {
 				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
 			}
 			if (outcome === "complete_delivered") {
+				(session.deliveredSteers ??= []).push(steerText.text);
 				await recordUserMessage(session.cwd, session.sessionId, steerText.text);
 				return { response: session.activeTurn! };
 			}
@@ -952,13 +999,17 @@ export class CursorAcpAgent implements Agent {
 		session: SessionState,
 		params: PromptRequest,
 	): Promise<SteerPromptText | null> {
+		const conversion = buildSteerPromptText(session.sessionId, params.prompt);
+		(session.steerConversions ??= new Set()).add(conversion);
 		try {
-			return await buildSteerPromptText(session.sessionId, params.prompt);
+			return await conversion;
 		} catch (error) {
 			if (!session.cancelled) {
 				throw error;
 			}
 			return null;
+		} finally {
+			session.steerConversions.delete(conversion);
 		}
 	}
 
@@ -1019,7 +1070,12 @@ export class CursorAcpAgent implements Agent {
 				promptText = customPrompt;
 			}
 		}
-		return await this.runPrimaryPrompt(session, promptText, promptImages);
+		session.deliveredSteers = [];
+		try {
+			return await this.runPrimaryPrompt(session, promptText, promptImages);
+		} finally {
+			session.deliveredSteers = undefined;
+		}
 	}
 
 	private async runPrimaryPrompt(
@@ -1054,10 +1110,13 @@ export class CursorAcpAgent implements Agent {
 			(session.modeId === "default" || session.modeId === "auto-review") &&
 			firstAttempt.rejectedToolCalls.length > 0
 		) {
-			const approved = await this.requestPermissionToRetry(
-				session.sessionId,
-				firstAttempt.rejectedToolCalls[0]!,
-			);
+			const approved = await Promise.race([
+				this.requestPermissionToRetry(
+					session.sessionId,
+					firstAttempt.rejectedToolCalls[0]!,
+				),
+				session.cancelResponse!.then(() => "reject" as const),
+			]);
 
 			if (session.cancelled) {
 				return { stopReason: "cancelled" };
@@ -1076,7 +1135,8 @@ export class CursorAcpAgent implements Agent {
 			}
 
 			if (approved === "allow_once" || approved === "allow_always") {
-				return await this.runPromptAttempt(session, promptText, promptImages, true);
+				const replayPrompt = [promptText, ...(session.deliveredSteers ?? [])].join("\n\n");
+				return await this.runPromptAttempt(session, replayPrompt, promptImages, true);
 			}
 		}
 
@@ -1086,13 +1146,19 @@ export class CursorAcpAgent implements Agent {
 	async cancel(params: CancelNotification): Promise<void> {
 		const session = this.requireSession(params.sessionId);
 		session.cancelled = true;
+		session.cancelEpoch = (session.cancelEpoch ?? 0) + 1;
+		session.cancelCleanup ??= (async () => {
+			await Promise.allSettled(session.steerConversions ?? []);
+			await cleanupSessionSteerAttachments(params.sessionId);
+		})();
+		session.resolveCancel?.({ stopReason: "cancelled" });
 		for (const prompt of session.pendingPrompts?.splice(0) ?? []) {
 			prompt.resolve({ stopReason: "cancelled" });
 		}
 		session.activeRun?.cancel();
 		await session.nativeClient?.cancel();
 		// Nothing references the attachments once every pending prompt settled.
-		await cleanupSessionSteerAttachments(params.sessionId);
+		await session.cancelCleanup;
 	}
 
 	async closeSession(params: CloseSessionRequest): Promise<void> {

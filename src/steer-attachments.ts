@@ -190,7 +190,14 @@ export async function cleanupSessionSteerAttachments(
 	sessionId: string,
 	tmpDir: string = os.tmpdir(),
 ): Promise<void> {
-	await rm(steerSessionDir(sessionId, tmpDir), { recursive: true, force: true });
+	await rm(steerSessionDir(sessionId, tmpDir), {
+		recursive: true,
+		force: true,
+		// In-flight attachment writes can recreate files while the removal is
+		// running; retry so a racing writer cannot leave the directory behind.
+		maxRetries: 10,
+		retryDelay: 20,
+	});
 }
 
 /**
@@ -219,7 +226,7 @@ export async function cleanupExpiredSteerAttachments(
 		try {
 			const info = await stat(dir);
 			if (info.mtimeMs < cutoff) {
-				await rm(dir, { recursive: true, force: true });
+				await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 				removed += 1;
 			}
 		} catch {

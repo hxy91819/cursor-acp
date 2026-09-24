@@ -3323,6 +3323,128 @@ describe("CursorAcpAgent", () => {
 		await steer;
 	});
 
+	it("consecutive attachment steers queue with their converted text", async () => {
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await rm(steerSessionDir(session.sessionId), { recursive: true, force: true });
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		setSteerHandler(async () => "revert_to_followup");
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const firstSteer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		const secondSteer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [
+				{ type: "text", text: "second" },
+				{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" },
+			],
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		// The second steer must not call run.steer while the first is deferred.
+		expect(steerCalls).toHaveLength(1);
+		finishRuns[0]?.();
+		expect(await primary).toEqual({ stopReason: "end_turn" });
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(legacyPromptCalls[1]?.promptText).toBe(steerCalls[0]);
+		expect(legacyPromptCalls[1]?.images).toBeUndefined();
+		finishRuns[1]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		// The second steer runs with the same converted text it would have been
+		// injected with, and without raw image blocks.
+		expect(legacyPromptCalls[2]?.promptText).toContain("second");
+		expect(legacyPromptCalls[2]?.promptText).toContain("(MIME: image/png)");
+		expect(legacyPromptCalls[2]?.images).toBeUndefined();
+		const secondPath =
+			/\[attachment: (.+?) \(MIME: image\/png\)/.exec(
+				legacyPromptCalls[2]!.promptText,
+			)?.[1] ?? "";
+		expect(secondPath).not.toBe("");
+		expect(existsSync(secondPath)).toBe(true);
+		finishRuns[2]?.();
+		expect(await Promise.all([firstSteer, secondSteer])).toEqual([
+			{ stopReason: "end_turn" },
+			{ stopReason: "end_turn" },
+		]);
+		expect(steerCalls).toHaveLength(1);
+	});
+
+	it("cancel during attachment writes still removes the files", async () => {
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await rm(steerSessionDir(session.sessionId), { recursive: true, force: true });
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		let releaseFirstSteer: (() => void) | undefined;
+		setSteerHandler(async () => {
+			if (steerCalls.length === 1) {
+				return await new Promise((resolve) => {
+					releaseFirstSteer = () => resolve("revert_to_followup");
+				});
+			}
+			return "complete_delivered";
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		void agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		// Many attachments keep the conversion in flight while cancel arrives.
+		const manyImages = Array.from({ length: 150 }, () => ({
+			type: "image" as const,
+			data: PNG_STEER_ATTACHMENT,
+			mimeType: "image/png",
+		}));
+		const secondSteer = agent.prompt({ sessionId: session.sessionId, prompt: manyImages });
+		releaseFirstSteer?.();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await agent.cancel({ sessionId: session.sessionId });
+		finishRuns[0]?.();
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+		expect(await secondSteer).toEqual({ stopReason: "cancelled" });
+		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
+	});
+
 	it("prompt during permission retry gap queues for a later run", async () => {
 		const { agent, client, legacyPromptCalls, steerCalls, setLegacyPromptHandler } =
 			createAgentTestHarness({ supportsSteering: true });

@@ -38,6 +38,7 @@ import {
 	buildSteerPromptText,
 	cleanupSessionSteerAttachments,
 	startExpiredSteerAttachmentCleanup,
+	type SteerPromptText,
 } from "./steer-attachments.js";
 import {
 	ExtendedInitializeRequest,
@@ -892,11 +893,24 @@ export class CursorAcpAgent implements Agent {
 			if (session.cancelled) {
 				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
 			}
-			// A preceding steer may have been returned while this one waited its turn.
+			// Non-text blocks are written to per-session temp files and replaced by
+			// references, so the SDK's text-only steer can carry them. Inputs that
+			// end up deferred run with the same text they would have been injected
+			// with, so the agent sees identical content either way.
+			const steerText = await this.resolveSteerText(session, params);
+			if (steerText === null || session.cancelled) {
+				// Cancel raced or followed the attachment writes and may have had
+				// its cleanup undone by files recreating the session directory.
+				await cleanupSessionSteerAttachments(session.sessionId);
+				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
+			}
+			// A preceding steer may have been returned while this one waited its
+			// turn; queue behind it with the same converted text.
 			if (session.pendingPrompts?.length || !session.activeRun) {
-				return { response: this.queuePrompt(session, params) };
+				return { response: this.queuePrompt(session, params, steerText.text) };
 			}
 			if (!canSteer) {
+				await cleanupSessionSteerAttachments(session.sessionId);
 				throw RequestError.internalError(
 					undefined,
 					"This input cannot be steered during the current Cursor turn",
@@ -904,14 +918,12 @@ export class CursorAcpAgent implements Agent {
 			}
 			const run = session.activeRun;
 			if (!run.steer) {
+				await cleanupSessionSteerAttachments(session.sessionId);
 				throw RequestError.internalError(
 					undefined,
 					"This Cursor run does not support steering",
 				);
 			}
-			// Non-text blocks are written to per-session temp files and replaced by
-			// references, so the SDK's text-only steer can carry them.
-			const steerText = await buildSteerPromptText(session.sessionId, params.prompt);
 			const outcome = await run.steer(steerText.text);
 			if (session.cancelled) {
 				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
@@ -929,6 +941,25 @@ export class CursorAcpAgent implements Agent {
 		return await (
 			await delivery
 		).response;
+	}
+
+	/**
+	 * Convert a steer prompt to its temp-file reference text. Returns null when
+	 * cancellation raced the attachment writes; the prompt then settles as
+	 * cancelled and the caller cleans up any files the writes left behind.
+	 */
+	private async resolveSteerText(
+		session: SessionState,
+		params: PromptRequest,
+	): Promise<SteerPromptText | null> {
+		try {
+			return await buildSteerPromptText(session.sessionId, params.prompt);
+		} catch (error) {
+			if (!session.cancelled) {
+				throw error;
+			}
+			return null;
+		}
 	}
 
 	private async executePrimaryPrompt(

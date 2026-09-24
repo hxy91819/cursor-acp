@@ -4,6 +4,7 @@ import {
 	AvailableCommand,
 	CancelNotification,
 	ClientCapabilities,
+	CloseSessionRequest,
 	ForkSessionRequest,
 	ForkSessionResponse,
 	InitializeRequest,
@@ -33,6 +34,11 @@ import {
 } from "@agentclientprotocol/sdk";
 import { randomUUID } from "node:crypto";
 import packageJson from "../package.json" with { type: "json" };
+import {
+	buildSteerPromptText,
+	cleanupSessionSteerAttachments,
+	startExpiredSteerAttachmentCleanup,
+} from "./steer-attachments.js";
 import {
 	ExtendedInitializeRequest,
 	looseSessionDefaults,
@@ -467,6 +473,8 @@ interface PromptAttemptResult {
 
 interface PendingPrompt {
 	params: PromptRequest;
+	/** Steer text with attachments replaced by temp-file references; set for deferred steers. */
+	steerText?: string;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: unknown) => void;
 }
@@ -550,6 +558,7 @@ export class CursorAcpAgent implements Agent {
 		this.createNativeClient =
 			options.createNativeClient ??
 			((nativeOptions, callbacks) => new CursorNativeAcpClient(nativeOptions, callbacks));
+		startExpiredSteerAttachmentCleanup(this.logger);
 	}
 
 	async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -599,6 +608,7 @@ export class CursorAcpAgent implements Agent {
 					fork: {},
 					resume: {},
 					list: {},
+					close: {},
 				},
 			},
 			agentInfo: {
@@ -785,7 +795,7 @@ export class CursorAcpAgent implements Agent {
 			const slash = parseLeadingSlashCommand(promptText);
 			if (!session.activeTurn) {
 				return session.steerQueue
-					? await this.steerPrompt(session, params, promptText, false)
+					? await this.steerPrompt(session, params, false)
 					: await this.queuePrompt(session, params);
 			}
 			if (!this.runner.supportsMidTurnSteering) {
@@ -799,12 +809,9 @@ export class CursorAcpAgent implements Agent {
 			if (!session.steerQueue && (session.pendingPrompts?.length || !session.activeRun)) {
 				return await this.queuePrompt(session, params);
 			}
-			return await this.steerPrompt(
-				session,
-				params,
-				promptText,
-				params.prompt.every((block) => block.type === "text"),
-			);
+			// Any mid-turn input can be steered: non-text blocks are converted to
+			// temp-file references before the text is handed to the SDK run.
+			return await this.steerPrompt(session, params, true);
 		}
 		session.cancelled = false;
 		session.processingPrompts = true;
@@ -813,12 +820,16 @@ export class CursorAcpAgent implements Agent {
 		return await primary;
 	}
 
-	private queuePrompt(session: SessionState, params: PromptRequest): Promise<PromptResponse> {
+	private queuePrompt(
+		session: SessionState,
+		params: PromptRequest,
+		steerText?: string,
+	): Promise<PromptResponse> {
 		if (session.cancelled) {
 			return Promise.resolve({ stopReason: "cancelled" });
 		}
 		return new Promise((resolve, reject) => {
-			(session.pendingPrompts ??= []).push({ params, resolve, reject });
+			(session.pendingPrompts ??= []).push({ params, steerText, resolve, reject });
 		});
 	}
 
@@ -846,7 +857,7 @@ export class CursorAcpAgent implements Agent {
 				if (!prompt) {
 					break;
 				}
-				const turn = this.executePrimaryPrompt(session, prompt.params);
+				const turn = this.executePrimaryPrompt(session, prompt.params, prompt.steerText);
 				session.activeTurn = turn;
 				try {
 					prompt.resolve(await turn);
@@ -875,7 +886,6 @@ export class CursorAcpAgent implements Agent {
 	private async steerPrompt(
 		session: SessionState,
 		params: PromptRequest,
-		text: string,
 		canSteer: boolean,
 	): Promise<PromptResponse> {
 		const delivery = (session.steerQueue ?? Promise.resolve()).then(async () => {
@@ -899,15 +909,18 @@ export class CursorAcpAgent implements Agent {
 					"This Cursor run does not support steering",
 				);
 			}
-			const outcome = await run.steer(text);
+			// Non-text blocks are written to per-session temp files and replaced by
+			// references, so the SDK's text-only steer can carry them.
+			const steerText = await buildSteerPromptText(session.sessionId, params.prompt);
+			const outcome = await run.steer(steerText.text);
 			if (session.cancelled) {
 				return { response: Promise.resolve({ stopReason: "cancelled" as const }) };
 			}
 			if (outcome === "complete_delivered") {
-				await recordUserMessage(session.cwd, session.sessionId, text);
+				await recordUserMessage(session.cwd, session.sessionId, steerText.text);
 				return { response: session.activeTurn! };
 			}
-			return { response: this.queuePrompt(session, params) };
+			return { response: this.queuePrompt(session, params, steerText.text) };
 		});
 		session.steerQueue = delivery.then(
 			() => undefined,
@@ -921,9 +934,12 @@ export class CursorAcpAgent implements Agent {
 	private async executePrimaryPrompt(
 		session: SessionState,
 		params: PromptRequest,
+		steerText?: string,
 	): Promise<PromptResponse> {
-		let promptText = promptToCursorText(params);
-		const promptImages = promptToCursorImages(params);
+		// A deferred steer runs with the same temp-file reference text it was
+		// injected with, so the agent sees identical content either way.
+		let promptText = steerText ?? promptToCursorText(params);
+		const promptImages = steerText ? undefined : promptToCursorImages(params);
 		const slash = parseLeadingSlashCommand(promptText);
 		if (slash.hasSlash && !this.hasNativeSlashCommand(session, slash.command)) {
 			const handled = await handleSlashCommand(slash.command, slash.args, {
@@ -1044,6 +1060,19 @@ export class CursorAcpAgent implements Agent {
 		}
 		session.activeRun?.cancel();
 		await session.nativeClient?.cancel();
+		// Nothing references the attachments once every pending prompt settled.
+		await cleanupSessionSteerAttachments(params.sessionId);
+	}
+
+	async closeSession(params: CloseSessionRequest): Promise<void> {
+		const session = this.sessions[params.sessionId];
+		if (!session) {
+			return;
+		}
+		// Cancel any ongoing work as if session/cancel was called, then free the
+		// session's resources, including its steer attachment files.
+		await this.cancel({ sessionId: params.sessionId });
+		delete this.sessions[params.sessionId];
 	}
 
 	async unstable_setSessionModel(

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -21,6 +22,7 @@ import {
 import { CursorAcpAgent } from "../cursor-acp-agent.js";
 import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { RunPromptOptions } from "../cursor-cli-runner.js";
+import { steerSessionDir } from "../steer-attachments.js";
 import { recordAssistantMessage, recordUserMessage } from "../session-storage.js";
 import type { CursorModelDescriptor } from "../slash-commands.js";
 import {
@@ -30,6 +32,14 @@ import {
 	newSessionRequest,
 } from "./test-support.js";
 import type { LegacyPromptHandler, TestCliRunner } from "./test-support.js";
+
+/** Minimal image payload used to exercise steer attachment conversion. */
+const PNG_STEER_ATTACHMENT = Buffer.from("steer-attachment-image-bytes").toString("base64");
+
+/** Permission bits of a file or directory, as seen by the current user. */
+async function statMode(target: string): Promise<number> {
+	return (await stat(target)).mode & 0o777;
+}
 
 class FakeClient implements CursorAcpClient {
 	updates: SessionNotification[] = [];
@@ -257,6 +267,7 @@ function createAgentTestHarness(
 	const steerCalls: string[] = [];
 	const legacyPromptCalls: {
 		promptText: string;
+		images?: RunPromptOptions["images"];
 		backendSessionId?: string;
 		modelId?: string;
 		reviewPolicy?: RunPromptOptions["reviewPolicy"];
@@ -283,6 +294,7 @@ function createAgentTestHarness(
 		startPrompt(options: RunPromptOptions) {
 			legacyPromptCalls.push({
 				promptText: options.prompt,
+				images: options.images,
 				backendSessionId: options.backendSessionId,
 				modelId: options.modelId,
 				reviewPolicy: options.reviewPolicy,
@@ -3035,7 +3047,7 @@ describe("CursorAcpAgent", () => {
 	});
 
 	it("steer paths never return the busy error", async () => {
-		const { agent, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
 			createAgentTestHarness({ supportsSteering: true });
 		await agent.initialize(initRequest());
 		const session = await agent.newSession(newSessionRequest());
@@ -3059,6 +3071,15 @@ describe("CursorAcpAgent", () => {
 			prompt: [{ type: "text", text: "work" }],
 		});
 		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const attachmentSteer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [
+				{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" },
+				{ type: "text", text: "with attachment" },
+			],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		expect(steerCalls[0]).toContain("(MIME: image/png)");
 		const returned = agent.prompt({
 			sessionId: session.sessionId,
 			prompt: [{ type: "text", text: "returned" }],
@@ -3073,9 +3094,233 @@ describe("CursorAcpAgent", () => {
 		finishRuns[1]?.();
 		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
 		finishRuns[2]?.();
-		expect(await Promise.all([primary, returned, queued])).toEqual(
-			Array(3).fill({ stopReason: "end_turn" }),
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(4));
+		finishRuns[3]?.();
+		expect(await Promise.all([primary, attachmentSteer, returned, queued])).toEqual(
+			Array(4).fill({ stopReason: "end_turn" }),
 		);
+		expect(legacyPromptCalls[1]?.promptText).toContain("(MIME: image/png)");
+		expect(legacyPromptCalls[1]?.images).toBeUndefined();
+	});
+
+	it("non-text blocks in a steer become temp-file references in order", async () => {
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await rm(steerSessionDir(session.sessionId), { recursive: true, force: true });
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const steer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [
+				{ type: "text", text: "check this screenshot" },
+				{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" },
+				{
+					type: "resource",
+					resource: {
+						uri: "file:///notes.md",
+						text: "# release notes",
+						mimeType: "text/markdown",
+					},
+				},
+				{
+					type: "resource_link",
+					uri: "https://example.com/design-doc",
+					name: "design-doc",
+				},
+				{ type: "text", text: "then summarize" },
+			],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		const steerText = steerCalls[0]!;
+
+		// Text blocks are kept verbatim; embedded resource content is written to
+		// its file instead of being inlined; blocks appear in order.
+		const positions = [
+			steerText.indexOf("check this screenshot"),
+			steerText.indexOf("https://example.com/design-doc"),
+			steerText.indexOf("then summarize"),
+		];
+		expect(steerText).not.toContain("# release notes");
+		expect(positions.every((index) => index >= 0)).toBe(true);
+		expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+
+		// Attachments are replaced by fixed-format reference lines, in order.
+		const refs = [...steerText.matchAll(/\[attachment: (.+?) \(MIME: ([^)]+)\)/g)];
+		expect(refs).toHaveLength(2);
+		expect(refs.map((ref) => ref[2])).toEqual(["image/png", "text/markdown"]);
+		for (const ref of refs) {
+			expect(steerText.indexOf(ref[0]!)).toBeGreaterThan(positions[0]!);
+		}
+		expect(steerText.indexOf(refs[0]![0])).toBeLessThan(steerText.indexOf(refs[1]![0]));
+		expect(steerText.indexOf("https://example.com/design-doc")).toBeGreaterThan(
+			steerText.indexOf(refs[1]![0]),
+		);
+		expect(steerText).toContain("use the read-file tool to view it if needed");
+
+		// Files are written with the MIME extension and only the current user
+		// can read or write them.
+		const firstPath = refs[0]![1]!;
+		const secondPath = refs[1]![1]!;
+		expect(firstPath.endsWith(".png")).toBe(true);
+		expect(secondPath.endsWith(".md")).toBe(true);
+		expect(existsSync(firstPath)).toBe(true);
+		expect(existsSync(secondPath)).toBe(true);
+		expect(await statMode(firstPath)).toBe(0o600);
+		expect(await statMode(secondPath)).toBe(0o600);
+		const dir = steerSessionDir(session.sessionId);
+		expect(await statMode(dir)).toBe(0o700);
+		expect(path.dirname(firstPath)).toBe(dir);
+		expect(path.dirname(secondPath)).toBe(dir);
+
+		finishRuns[0]?.();
+		expect(await primary).toEqual({ stopReason: "end_turn" });
+		await steer;
+	});
+
+	it("attachment files are cleaned up on session close", async () => {
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await rm(steerSessionDir(session.sessionId), { recursive: true, force: true });
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const steer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		const filePath = /\[attachment: (.+?) \(MIME: image\/png\)/.exec(steerCalls[0]!)?.[1] ?? "";
+		expect(filePath).not.toBe("");
+		expect(existsSync(filePath)).toBe(true);
+
+		finishRuns[0]?.();
+		expect(await Promise.all([primary, steer])).toEqual([
+			{ stopReason: "end_turn" },
+			{ stopReason: "end_turn" },
+		]);
+		expect(existsSync(filePath)).toBe(true);
+
+		await agent.closeSession({ sessionId: session.sessionId });
+
+		expect(existsSync(filePath)).toBe(false);
+		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
+	});
+
+	it("cancel cleans up attachment files when nothing is pending", async () => {
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await rm(steerSessionDir(session.sessionId), { recursive: true, force: true });
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise(() => {
+					// Never resolves: cancel must still clean up the attachments.
+				}),
+		);
+		void agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		void agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		const filePath = /\[attachment: (.+?) \(MIME: image\/png\)/.exec(steerCalls[0]!)?.[1] ?? "";
+		expect(existsSync(filePath)).toBe(true);
+
+		await agent.cancel({ sessionId: session.sessionId });
+
+		expect(existsSync(filePath)).toBe(false);
+		expect(existsSync(steerSessionDir(session.sessionId))).toBe(false);
+	});
+
+	it("deferred steer with attachments runs with the temp-file reference text", async () => {
+		const { agent, steerCalls, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		await rm(steerSessionDir(session.sessionId), { recursive: true, force: true });
+		const finishRuns: Array<() => void> = [];
+		let deferredRunSawAttachmentFile: boolean | undefined;
+		setLegacyPromptHandler(
+			async (text) =>
+				await new Promise((resolve) => {
+					if (legacyPromptCalls.length === 2) {
+						const match = /\[attachment: (.+?) \(MIME: image\/png\)/.exec(text);
+						deferredRunSawAttachmentFile = match ? existsSync(match[1]!) : false;
+					}
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		setSteerHandler(async () => "revert_to_followup");
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const steer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "image", data: PNG_STEER_ATTACHMENT, mimeType: "image/png" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toHaveLength(1));
+		finishRuns[0]?.();
+		expect(await primary).toEqual({ stopReason: "end_turn" });
+
+		// The deferred input runs as a new run with the exact steer text that was
+		// handed to run.steer, and without raw image blocks.
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		expect(legacyPromptCalls[1]?.promptText).toBe(steerCalls[0]);
+		expect(legacyPromptCalls[1]?.images).toBeUndefined();
+		expect(deferredRunSawAttachmentFile).toBe(true);
+		finishRuns[1]?.();
+		await steer;
 	});
 
 	it("prompt during permission retry gap queues for a later run", async () => {

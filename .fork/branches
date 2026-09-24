@@ -8,3 +8,4 @@ base upstream-main/20260924-d422bdd
 
 fork-tooling          internal                                          # fork 维护规则与聚合脚本
 feature/cursor-sdk-1-0-32 needs-feedback                                # 升级 Cursor SDK 至 1.0.32 并适配署名补丁
+feature/mid-turn-steering needs-feedback                                # 叠在 feature/cursor-sdk-1-0-32 上；支持 Cursor SDK 文本 steer

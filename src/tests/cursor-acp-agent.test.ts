@@ -245,11 +245,16 @@ function createAgentTestHarness(
 		createSessionBlocker?: Promise<void>;
 		createSessionBlockers?: Array<Promise<void> | undefined>;
 		models?: CursorModelDescriptor[];
+		supportsSteering?: boolean;
 	} = {},
 ) {
 	const backends: FakeNativeBackend[] = [];
 	const client = new FakeClient();
 	let legacyPromptHandler: LegacyPromptHandler | undefined;
+	let steerHandler:
+		| ((text: string) => Promise<"complete_delivered" | "revert_to_followup">)
+		| undefined;
+	const steerCalls: string[] = [];
 	const legacyPromptCalls: {
 		promptText: string;
 		backendSessionId?: string;
@@ -259,6 +264,7 @@ function createAgentTestHarness(
 	}[] = [];
 
 	const runner: TestCliRunner = {
+		supportsMidTurnSteering: backendOptions.supportsSteering,
 		async createChat() {
 			return "legacy-chat-1";
 		},
@@ -299,6 +305,14 @@ function createAgentTestHarness(
 			return {
 				completed,
 				cancel() {},
+				...(backendOptions.supportsSteering
+					? {
+							steer: async (text: string) => {
+								steerCalls.push(text);
+								return await (steerHandler?.(text) ?? "complete_delivered");
+							},
+						}
+					: {}),
 			};
 		},
 	};
@@ -336,6 +350,10 @@ function createAgentTestHarness(
 		backends,
 		client,
 		legacyPromptCalls,
+		steerCalls,
+		setSteerHandler(handler: NonNullable<typeof steerHandler>) {
+			steerHandler = handler;
+		},
 		setLegacyPromptHandler(handler: LegacyPromptHandler) {
 			legacyPromptHandler = handler;
 		},
@@ -2428,6 +2446,278 @@ describe("CursorAcpAgent", () => {
 
 		resolvePrompt?.();
 		await first;
+	});
+
+	it("initialize advertises only the top-level midTurnSteering declaration", async () => {
+		const capable = createAgentTestHarness({ supportsSteering: true });
+		const response = await capable.agent.initialize(initRequest());
+		expect(response._meta).toEqual({ midTurnSteering: true });
+		expect(response.agentCapabilities).not.toHaveProperty("midTurnSteering");
+
+		const unsupported = createAgentTestHarness();
+		expect((await unsupported.agent.initialize(initRequest()))._meta).toBeUndefined();
+	});
+
+	it("stacked steers are delivered in arrival order", async () => {
+		const harness = createAgentTestHarness({ supportsSteering: true });
+		const { agent, legacyPromptCalls, steerCalls, setLegacyPromptHandler, setSteerHandler } =
+			harness;
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRun = () =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						});
+				}),
+		);
+		let deliverFirst: (() => void) | undefined;
+		setSteerHandler(async (text) => {
+			if (text === "first steer") {
+				await new Promise<void>((resolve) => {
+					deliverFirst = resolve;
+				});
+			}
+			return "complete_delivered";
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		const first = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "first steer" }],
+		});
+		const second = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "second steer" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toEqual(["first steer"]));
+		deliverFirst?.();
+		await vi.waitFor(() => expect(steerCalls).toEqual(["first steer", "second steer"]));
+		finishRun?.();
+		expect(await Promise.all([primary, first, second])).toEqual([
+			{ stopReason: "end_turn" },
+			{ stopReason: "end_turn" },
+			{ stopReason: "end_turn" },
+		]);
+		expect(legacyPromptCalls).toHaveLength(1);
+	});
+
+	it("steer arriving before the SDK run waits for that run", async () => {
+		const { agent, steerCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			supportsSteering: true,
+		});
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRun = () =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						});
+				}),
+		);
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		const steer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "early steer" }],
+		});
+		await vi.waitFor(() => expect(steerCalls).toEqual(["early steer"]));
+		finishRun?.();
+		expect(await Promise.all([primary, steer])).toEqual([
+			{ stopReason: "end_turn" },
+			{ stopReason: "end_turn" },
+		]);
+	});
+
+	it("delivered steer settles with the shared run", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			supportsSteering: true,
+		});
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRun = () =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "max_turns", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						});
+				}),
+		);
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		let settled = false;
+		const steer = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "adjust" }],
+		});
+		void steer.then(() => {
+			settled = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(settled).toBe(false);
+		finishRun?.();
+		expect(await Promise.all([primary, steer])).toEqual([
+			{ stopReason: "max_turn_requests" },
+			{ stopReason: "max_turn_requests" },
+		]);
+	});
+
+	it("delivered steer is visible when the session resumes", async () => {
+		const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-steer-history-"));
+		process.env.CURSOR_ACP_CONFIG_DIR = tempRoot;
+		try {
+			const {
+				agent,
+				legacyPromptCalls,
+				steerCalls,
+				setLegacyPromptHandler,
+				setSteerHandler,
+			} = createAgentTestHarness({ supportsSteering: true });
+			await agent.initialize(initRequest());
+			const session = await agent.newSession(
+				newSessionRequest({ cwd: "/tmp/steer-project" }),
+			);
+			let finishRun: (() => void) | undefined;
+			setLegacyPromptHandler(
+				async (_text, { onEvent }) =>
+					await new Promise((resolve) => {
+						finishRun = () => {
+							void (async () => {
+								await onEvent?.({
+									type: "assistant",
+									message: { content: [{ type: "text", text: "done" }] },
+								});
+								resolve({
+									events: [],
+									resultEvent: {
+										type: "result",
+										subtype: "success",
+										is_error: false,
+									},
+									stderr: "",
+									exitCode: 0,
+								});
+							})();
+						};
+					}),
+			);
+			let deliverSteer: (() => void) | undefined;
+			setSteerHandler(
+				async () =>
+					await new Promise((resolve) => {
+						deliverSteer = () => resolve("complete_delivered");
+					}),
+			);
+			const primary = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "work" }],
+			});
+			await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+			const steer = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "adjust" }],
+			});
+			await vi.waitFor(() => expect(steerCalls).toEqual(["adjust"]));
+			let primarySettled = false;
+			void primary.then(() => {
+				primarySettled = true;
+			});
+			finishRun?.();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(primarySettled).toBe(false);
+			deliverSteer?.();
+			await Promise.all([primary, steer]);
+
+			const resumed = createAgentTestHarness({ supportsSteering: true });
+			await resumed.agent.initialize(initRequest());
+			await resumed.agent.unstable_resumeSession({
+				sessionId: session.sessionId,
+				cwd: "/tmp/steer-project",
+				mcpServers: [],
+			});
+			await waitForScheduledUpdates();
+			expect(
+				resumed.client.updates.flatMap((update) => {
+					const item = update.update;
+					if (
+						(item.sessionUpdate === "user_message_chunk" ||
+							item.sessionUpdate === "agent_message_chunk") &&
+						item.content.type === "text"
+					) {
+						return [`${item.sessionUpdate}:${item.content.text}`];
+					}
+					return [];
+				}),
+			).toEqual([
+				"user_message_chunk:work",
+				"user_message_chunk:adjust",
+				"agent_message_chunk:done",
+			]);
+		} finally {
+			delete process.env.CURSOR_ACP_CONFIG_DIR;
+			await rm(tempRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("reverted steer returns a clear error without waiting for the run", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler, setSteerHandler } =
+			createAgentTestHarness({ supportsSteering: true });
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(newSessionRequest());
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRun = () =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						});
+				}),
+		);
+		setSteerHandler(async () => "revert_to_followup");
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		await expect(
+			agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "too late" }],
+			}),
+		).rejects.toThrow(
+			/Steer was returned at the end of the turn; deferred follow-up is not yet supported/,
+		);
+		finishRun?.();
+		await primary;
 	});
 
 	it("rejects model changes while a prompt is active", async () => {

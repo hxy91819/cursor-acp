@@ -48,7 +48,7 @@ import {
 	NativeSessionBackend,
 	NativeSessionCallbacks,
 } from "./cursor-native-acp-client.js";
-import type { CursorRunner, RunPromptOptions } from "./cursor-runner.js";
+import type { CursorPromptRun, CursorRunner, RunPromptOptions } from "./cursor-runner.js";
 import { CursorSdkRunner } from "./cursor-sdk-runner.js";
 import type {
 	ExtendedNewSessionResponse,
@@ -457,6 +457,7 @@ interface ActivePromptState {
 
 interface ActiveRunState {
 	cancel: () => void;
+	steer?: CursorPromptRun["steer"];
 }
 
 interface PromptAttemptResult {
@@ -479,6 +480,11 @@ export interface SessionState {
 	cancelled: boolean;
 	activePrompt?: ActivePromptState;
 	activeRun?: ActiveRunState;
+	activeTurn?: Promise<PromptResponse>;
+	activeRunReady?: Promise<CursorPromptRun>;
+	resolveActiveRun?: (run: CursorPromptRun) => void;
+	rejectActiveRun?: (error: Error) => void;
+	steerQueue?: Promise<void>;
 	backendSessionId?: string;
 	/** Populated from native `session/new` or `session/load` when available. */
 	nativeSessionModels?: LegacySessionModels;
@@ -569,6 +575,7 @@ export class CursorAcpAgent implements Agent {
 
 		return {
 			protocolVersion: 1,
+			...(this.runner.supportsMidTurnSteering ? { _meta: { midTurnSteering: true } } : {}),
 			agentCapabilities: {
 				loadSession: true,
 				mcpCapabilities: {
@@ -826,6 +833,87 @@ export class CursorAcpAgent implements Agent {
 			}
 		}
 
+		if (session.activeTurn) {
+			if (!this.runner.supportsMidTurnSteering) {
+				throw RequestError.invalidParams(
+					undefined,
+					"Cannot send a prompt while another prompt is in progress",
+				);
+			}
+			if (slash.hasSlash || params.prompt.some((block) => block.type !== "text")) {
+				throw RequestError.internalError(
+					undefined,
+					"This input cannot be steered during the current Cursor turn",
+				);
+			}
+			return await this.steerPrompt(session, promptText);
+		}
+
+		session.activeRunReady = new Promise<CursorPromptRun>((resolve, reject) => {
+			session.resolveActiveRun = resolve;
+			session.rejectActiveRun = reject;
+		});
+		void session.activeRunReady.catch(() => undefined);
+		const primary = this.runPrimaryPrompt(session, promptText, promptImages);
+		session.activeTurn = primary;
+		try {
+			return await primary;
+		} finally {
+			session.rejectActiveRun?.(
+				new Error("Cursor turn ended before a run was ready for steering"),
+			);
+			session.activeTurn = undefined;
+			session.activeRunReady = undefined;
+			session.resolveActiveRun = undefined;
+			session.rejectActiveRun = undefined;
+			session.steerQueue = undefined;
+		}
+	}
+
+	private async steerPrompt(session: SessionState, text: string): Promise<PromptResponse> {
+		const turn = session.activeTurn!;
+		const runReady = session.activeRun
+			? Promise.resolve(session.activeRun)
+			: session.activeRunReady;
+		if (!runReady) {
+			throw RequestError.internalError(
+				undefined,
+				"Cursor turn has no active run available for steering",
+			);
+		}
+		const delivery = (session.steerQueue ?? Promise.resolve()).then(async () => {
+			const run = await runReady;
+			if (!run.steer) {
+				throw RequestError.internalError(
+					undefined,
+					"This Cursor run does not support steering",
+				);
+			}
+			const outcome = await run.steer(text);
+			if (outcome === "complete_delivered") {
+				await recordUserMessage(session.cwd, session.sessionId, text);
+			}
+			return outcome;
+		});
+		session.steerQueue = delivery.then(
+			() => undefined,
+			() => undefined,
+		);
+		const outcome = await delivery;
+		if (outcome === "revert_to_followup") {
+			throw RequestError.internalError(
+				undefined,
+				"Steer was returned at the end of the turn; deferred follow-up is not yet supported",
+			);
+		}
+		return await turn;
+	}
+
+	private async runPrimaryPrompt(
+		session: SessionState,
+		promptText: string,
+		promptImages: RunPromptOptions["images"],
+	): Promise<PromptResponse> {
 		const status = await this.auth.status();
 		if (!status.loggedIn) {
 			throw RequestError.authRequired();
@@ -1961,10 +2049,14 @@ export class CursorAcpAgent implements Agent {
 		});
 
 		session.activeRun = run;
+		session.resolveActiveRun?.(run);
 
 		try {
 			const completed = await run.completed;
 			session.activeRun = undefined;
+			session.activeRunReady = undefined;
+			// A delivered steer belongs before this run's assistant reply in replay history.
+			await session.steerQueue;
 
 			if (session.cancelled) {
 				return {
@@ -2014,6 +2106,7 @@ export class CursorAcpAgent implements Agent {
 			throw RequestError.internalError(undefined, resultText || "Cursor failed");
 		} catch (error) {
 			session.activeRun = undefined;
+			session.activeRunReady = undefined;
 			if (session.cancelled) {
 				return {
 					stopReason: "cancelled",

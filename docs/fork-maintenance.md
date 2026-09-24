@@ -113,7 +113,7 @@ BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全�
       "command": "node",
       "args": ["/data/code/cursor-acp/dist/index.js"],
       "steeringMode": "auto",
-      "nativeSkillRoots": ["~/.cursor/skills", ".cursor/skills"]
+      "nativeSkillRoots": { "user": [".cursor/skills"], "project": [".cursor/skills"] }
     }
   ]
 }

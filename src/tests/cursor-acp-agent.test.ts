@@ -650,7 +650,7 @@ describe("CursorAcpAgent", () => {
 		}
 	});
 
-	it("expands custom slash commands and skills before prompting Cursor", async () => {
+	it("expands custom slash commands and passes skill path and trailing request to Cursor", async () => {
 		const workspace = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-prompts-"));
 		await mkdir(path.join(workspace, ".cursor", "commands"), { recursive: true });
 		await mkdir(path.join(workspace, ".cursor", "skills", "workspace-skill"), {

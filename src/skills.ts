@@ -57,9 +57,18 @@ async function collectSkillFiles(
 					return null;
 				}
 			}
+			if (isDirectory && SKIPPED_DIRECTORIES.has(entry.name)) {
+				try {
+					isDirectory = (await fs.stat(path.join(fullPath, "SKILL.md"))).isFile();
+				} catch (error) {
+					if (!isMissing(error))
+						warn(`Unable to inspect skill directory ${fullPath}`, error);
+					isDirectory = false;
+				}
+			}
 			return {
 				fullPath,
-				isDirectory: isDirectory && !SKIPPED_DIRECTORIES.has(entry.name),
+				isDirectory,
 				isSkillFile: isFile && entry.name.toLowerCase() === "skill.md",
 			};
 		}),

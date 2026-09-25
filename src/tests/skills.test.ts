@@ -151,18 +151,21 @@ describe("skills", () => {
 		}
 	});
 
-	it("does not register nested examples or scan large directories and deep trees", async () => {
+	it("keeps named skill directories while skipping nested examples, large directories and deep trees", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-skill-bounds-"));
 		const skillsRoot = path.join(root, ".agents", "skills");
 		const primary = path.join(skillsRoot, "primary");
 		const example = path.join(primary, "examples", "nested");
 		const ignored = path.join(skillsRoot, "node_modules", "ignored");
+		const namedBuild = path.join(skillsRoot, "build");
 		const deep = path.join(skillsRoot, ...Array.from({ length: 9 }, (_, i) => `level${i}`));
-		for (const dir of [primary, example, ignored, deep]) await mkdir(dir, { recursive: true });
+		for (const dir of [primary, example, ignored, namedBuild, deep])
+			await mkdir(dir, { recursive: true });
 		for (const [dir, name] of [
 			[primary, "primary"],
 			[example, "example"],
 			[ignored, "ignored"],
+			[namedBuild, "build"],
 			[deep, "deep"],
 		]) {
 			await writeFile(path.join(dir, "SKILL.md"), `---\nname: ${name}\n---\nBody`);
@@ -170,7 +173,7 @@ describe("skills", () => {
 		try {
 			expect(
 				(await loadCustomSkills(root, path.join(root, "home"))).map((skill) => skill.name),
-			).toEqual(["primary"]);
+			).toEqual(["build", "primary"]);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

@@ -37,6 +37,8 @@ BB 只负责 `/` 菜单。BB 声明的有效技能根应与 cursor-acp 实际加
 
 cursor-acp 还加载存在的 `~/.cursor/skills` 与项目 `.cursor/skills`。本机这些根当前没有要展示的技能；若启用它们，应同步核对 BB 菜单根。SDK 本地设置来源使用 `user` 与 `project`，因此真实项目技能和项目规则可由 SDK 原生加载。
 
+BB 对不存在的技能根可能只给出空菜单，不另报配置错误。Tools → Skills 面板还会按扫描文件路径跨 provider 去重，先登记的 provider 可能取得共享技能的面板归属；应以目标 provider 的 `/` 菜单和模型真调用分别验证发现与加载。
+
 ## 验证方法
 
 1. 在 BB 网页的 Cursor (SDK) 会话输入 `/`，确认能选到 `tdd`、`research`、`code-review`、`wizard` 和 `ppt-visual-review`。这一步只检查菜单；`ppt-visual-review` 设有 `disable-model-invocation: true`，仍应能手动选择。

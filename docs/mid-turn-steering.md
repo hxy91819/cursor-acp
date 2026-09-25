@@ -58,33 +58,3 @@ The named tests below exercise the ACP agent boundary with an injected runner. T
 | Steer leaves permission request pending; approved retry includes delivered texts in order | `steer does not cancel a pending permission request`; `permission retry replays delivered steers` |
 | End-of-turn deferral may be displayed as injection by a client; attachment is a path rather than inline image | `reverted steer runs as a new run after the current one`; `non-text blocks in a steer become temp-file references in order` |
 | Whole-turn approval retry may repeat earlier work | `permission retry replays delivered steers` |
-
-## Appendix: registering with BB (get-bb)
-
-BB registers this adapter through the ACP providers plugin's `customAgents` setting. `nativeSkillRoots` controls which directories BB scans to list this agent's skills in the composer and the Skills panel. Two pitfalls found while integrating:
-
-1. A root that does not exist on the host fails **silently**: the skill and command menus just go empty. Verify every declared root actually contains `SKILL.md` files before handing the setup over.
-2. BB's Skills panel deduplicates native skills by scanned file path across providers, first registration wins. If the declared roots are shared with other installed providers (for example the common `.agents/skills`), earlier-registering providers claim those files and this agent's panel group may show nothing, even though the composer `/` menu keeps working (it is queried per provider). Declaring one root no other provider scans keeps the group non-empty.
-
-A verified recipe:
-
-```json
-{
-  "id": "cursor-sdk",
-  "displayName": "Cursor (SDK)",
-  "command": "node",
-  "args": ["/absolute/path/to/cursor-acp/dist/index.js"],
-  "steeringMode": "auto",
-  "nativeSkillRoots": {
-    "user": [
-      { "path": ".agents/skills", "recursive": true },
-      { "path": ".cursor/skills-cursor", "recursive": true }
-    ],
-    "project": [
-      { "path": ".agents/skills", "recursive": true, "ancestors": true }
-    ]
-  }
-}
-```
-
-`.agents/skills` is the cross-agent standard root; `.cursor/skills-cursor` holds the Cursor-bundled skills and is scanned by this adapter inside the SDK session as well, so the BB listing and the runtime skills stay consistent. After saving, check that the declared roots contain `SKILL.md` files, that the composer `/` menu lists skills, and that the Skills panel group for the new provider is non-empty.

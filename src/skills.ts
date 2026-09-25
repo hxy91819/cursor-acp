@@ -14,6 +14,13 @@ export interface CustomSkill {
 	template: string;
 	sourcePath: string;
 	origin: SkillOrigin;
+	linked: boolean;
+	disableModelInvocation: boolean;
+}
+
+interface SkillFile {
+	path: string;
+	linked: boolean;
 }
 
 async function collectSkillFiles(
@@ -21,7 +28,9 @@ async function collectSkillFiles(
 	seen: Set<string>,
 	warn: (message: string, error: unknown) => void,
 	depth = 0,
-): Promise<string[]> {
+	followLinks = true,
+	viaLink = false,
+): Promise<SkillFile[]> {
 	if (depth > MAX_SKILL_DEPTH) return [];
 	let realDir: string;
 	try {
@@ -48,6 +57,7 @@ async function collectSkillFiles(
 			let isDirectory = entry.isDirectory();
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
+				if (!followLinks) return null;
 				try {
 					const target = await fs.stat(fullPath);
 					isDirectory = target.isDirectory();
@@ -68,19 +78,20 @@ async function collectSkillFiles(
 			}
 			return {
 				fullPath,
+				linked: viaLink || entry.isSymbolicLink(),
 				isDirectory,
 				isSkillFile: isFile && entry.name.toLowerCase() === "skill.md",
 			};
 		}),
 	);
-	const files: string[] = [];
+	const files: SkillFile[] = [];
 	for (const item of classified) {
 		if (!item?.isSkillFile) continue;
 		try {
 			const realFile = await fs.realpath(item.fullPath);
 			if (!seen.has(realFile)) {
 				seen.add(realFile);
-				files.push(realFile);
+				files.push({ path: realFile, linked: item.linked });
 			}
 		} catch (error) {
 			if (!isMissing(error)) warn(`Unable to resolve skill file ${item.fullPath}`, error);
@@ -88,11 +99,18 @@ async function collectSkillFiles(
 	}
 	// A directory with SKILL.md is one skill; supporting examples inside it are not separate skills.
 	if (depth === 0 || !classified.some((item) => item?.isSkillFile)) {
-		const children = classified
-			.filter((item) => item?.isDirectory)
-			.map((item) => item!.fullPath);
+		const children = classified.filter((item) => item?.isDirectory);
 		for (const child of children) {
-			files.push(...(await collectSkillFiles(child, seen, warn, depth + 1)));
+			files.push(
+				...(await collectSkillFiles(
+					child!.fullPath,
+					seen,
+					warn,
+					depth + 1,
+					followLinks,
+					child!.linked,
+				)),
+			);
 		}
 	}
 
@@ -201,7 +219,8 @@ function cleanMetadataValue(value: string | undefined): string | undefined {
 	return trimmed.replace(/^['"](.+)['"]$/, "$1").trim() || undefined;
 }
 
-async function readSkill(filePath: string, origin: SkillOrigin): Promise<CustomSkill | null> {
+async function readSkill(file: SkillFile, origin: SkillOrigin): Promise<CustomSkill | null> {
+	const filePath = file.path;
 	const raw = await fs.readFile(filePath, "utf8");
 	const { metadata, body } = parseFrontmatter(raw);
 	const template = body.trim();
@@ -227,7 +246,24 @@ async function readSkill(filePath: string, origin: SkillOrigin): Promise<CustomS
 		template,
 		sourcePath: filePath,
 		origin,
+		linked: file.linked,
+		disableModelInvocation: metadata["disable-model-invocation"]?.toLowerCase() === "true",
 	};
+}
+
+async function skillRoots(
+	workspace: string,
+	homeDirectory: string,
+): Promise<Array<{ root: string; origin: SkillOrigin }>> {
+	return [
+		...(await workspaceDirectories(workspace)).flatMap((directory) => [
+			{ root: path.join(directory, ".cursor", "skills"), origin: "workspace" as const },
+			{ root: path.join(directory, ".agents", "skills"), origin: "workspace" as const },
+		]),
+		{ root: path.join(homeDirectory, ".agents", "skills"), origin: "user" },
+		{ root: path.join(homeDirectory, ".cursor", "skills"), origin: "user" },
+		{ root: path.join(homeDirectory, ".cursor", "skills-cursor"), origin: "cursor" },
+	];
 }
 
 export async function loadCustomSkills(
@@ -235,31 +271,18 @@ export async function loadCustomSkills(
 	homeDirectory: string = os.homedir(),
 	logger: Pick<Logger, "warn"> = console,
 ): Promise<CustomSkill[]> {
-	const skillRoots: Array<{ root: string; origin: SkillOrigin }> = [
-		...(await workspaceDirectories(workspace)).flatMap((directory) => [
-			{ root: path.join(directory, ".cursor", "skills"), origin: "workspace" as const },
-			{ root: path.join(directory, ".agents", "skills"), origin: "workspace" as const },
-		]),
-		{ root: path.join(homeDirectory, ".agents", "skills"), origin: "user" },
-		{ root: path.join(homeDirectory, ".cursor", "skills"), origin: "user" },
-		{
-			root: path.join(homeDirectory, ".cursor", "skills-cursor"),
-			origin: "cursor",
-		},
-	];
-
 	const byName = new Map<string, CustomSkill>();
 	const seen = new Set<string>();
 	const warn = (message: string, error: unknown) =>
 		logger.warn?.(`[cursor-acp] ${message}`, error);
-	for (const { root, origin } of skillRoots) {
+	for (const { root, origin } of await skillRoots(workspace, homeDirectory)) {
 		const files = await collectSkillFiles(root, seen, warn);
 		for (const file of files) {
 			let skill: CustomSkill | null;
 			try {
 				skill = await readSkill(file, origin);
 			} catch (error) {
-				if (!isMissing(error)) warn(`Unable to read skill file ${file}`, error);
+				if (!isMissing(error)) warn(`Unable to read skill file ${file.path}`, error);
 				continue;
 			}
 			if (!skill) {
@@ -273,6 +296,48 @@ export async function loadCustomSkills(
 	}
 
 	return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export async function loadSupplementalSkills(
+	workspace: string,
+	homeDirectory: string = os.homedir(),
+	logger: Pick<Logger, "warn"> = console,
+): Promise<CustomSkill[]> {
+	const skills = await loadCustomSkills(workspace, homeDirectory, logger);
+	const nativePaths = new Set<string>();
+	const nativeNames = new Set<string>();
+	const roots = await skillRoots(workspace, homeDirectory);
+	for (const directory of await workspaceDirectories(workspace)) {
+		for (const family of [".claude", ".codex"]) {
+			roots.push({ root: path.join(directory, family, "skills"), origin: "workspace" });
+		}
+	}
+	for (const family of [".claude", ".codex"]) {
+		roots.push({ root: path.join(homeDirectory, family, "skills"), origin: "user" });
+	}
+	const warn = (message: string, error: unknown) =>
+		logger.warn?.(`[cursor-acp] ${message}`, error);
+	const seen = new Set<string>();
+	for (const { root, origin } of roots) {
+		for (const file of await collectSkillFiles(root, seen, warn, 0, false)) {
+			try {
+				const skill = await readSkill(file, origin);
+				if (skill) {
+					nativePaths.add(skill.sourcePath);
+					nativeNames.add(skill.name.toLowerCase());
+				}
+			} catch (error) {
+				if (!isMissing(error)) warn(`Unable to read skill file ${file.path}`, error);
+			}
+		}
+	}
+	return skills.filter(
+		(skill) =>
+			skill.linked &&
+			!skill.disableModelInvocation &&
+			!nativePaths.has(skill.sourcePath) &&
+			!nativeNames.has(skill.name.toLowerCase()),
+	);
 }
 
 export function resolveSkillPrompt(

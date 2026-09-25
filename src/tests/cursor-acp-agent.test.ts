@@ -693,17 +693,24 @@ describe("CursorAcpAgent", () => {
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "/review-local src" }],
 			});
-			agentTestAccess(agent).sessions[session.sessionId].nativeAvailableCommands = [
-				{ name: "workspace-skill", description: "Native skill", input: null },
-			];
 			await agent.prompt({
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "/workspace-skill inspect deck.html" }],
+			});
+			await agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [
+					{
+						type: "text",
+						text: "<system_instructions>BB context</system_instructions>\n\n/workspace-skill check slides.html",
+					},
+				],
 			});
 
 			expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
 				"Review these changes: src",
 				`Skill file: ${path.join(workspace, ".cursor", "skills", "workspace-skill", "SKILL.md")}\nSkill directory: ${path.join(workspace, ".cursor", "skills", "workspace-skill")}\n\nSkill body\n\ninspect deck.html`,
+				`<system_instructions>BB context</system_instructions>\n\nSkill file: ${path.join(workspace, ".cursor", "skills", "workspace-skill", "SKILL.md")}\nSkill directory: ${path.join(workspace, ".cursor", "skills", "workspace-skill")}\n\nSkill body\n\ncheck slides.html`,
 			]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });

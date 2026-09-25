@@ -81,6 +81,7 @@ import {
 	parseLeadingSlashCommand,
 	promptToCursorImages,
 	promptToCursorText,
+	splitSystemInstructionsPrefix,
 } from "./prompt-conversion.js";
 import {
 	CustomSlashCommand,
@@ -768,12 +769,10 @@ export class CursorAcpAgent implements Agent {
 		let promptText = promptToCursorText(params);
 		const promptImages = promptToCursorImages(params);
 
-		const slash = parseLeadingSlashCommand(promptText);
-		const skillPrompt = slash.hasSlash
-			? resolveSkillSlashCommandPrompt(slash.command, slash.args, session.customSkills)
-			: null;
+		const { prefix, prompt } = splitSystemInstructionsPrefix(promptText);
+		const slash = parseLeadingSlashCommand(prompt);
 		if (slash.hasSlash) {
-			if (skillPrompt || !this.hasNativeSlashCommand(session, slash.command)) {
+			if (!this.hasNativeSlashCommand(session, slash.command)) {
 				const handled = await handleSlashCommand(slash.command, slash.args, {
 					session,
 					auth: this.auth,
@@ -822,9 +821,10 @@ export class CursorAcpAgent implements Agent {
 						slash.command,
 						slash.args,
 						session.customSlashCommands,
-					) ?? skillPrompt;
+					) ??
+					resolveSkillSlashCommandPrompt(slash.command, slash.args, session.customSkills);
 				if (customPrompt) {
-					promptText = customPrompt;
+					promptText = prefix + customPrompt;
 				}
 			}
 		}

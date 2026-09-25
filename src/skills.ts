@@ -146,13 +146,33 @@ function parseFrontmatter(markdown: string): {
 	}
 
 	const metadata: Record<string, string> = {};
-	for (const line of lines.slice(1, end)) {
+	const frontmatter = lines.slice(1, end);
+	for (let i = 0; i < frontmatter.length; i += 1) {
+		const line = frontmatter[i]!;
 		const delimiter = line.indexOf(":");
 		if (delimiter <= 0) {
 			continue;
 		}
 		const key = line.slice(0, delimiter).trim().toLowerCase();
-		const value = line.slice(delimiter + 1).trim();
+		let value = line.slice(delimiter + 1).trim();
+		if (/^[>|][+-]?$/.test(value)) {
+			const folded = value.startsWith(">");
+			const block: string[] = [];
+			while (i + 1 < frontmatter.length) {
+				const next = frontmatter[i + 1]!;
+				if (next.trim() && !/^\s/.test(next)) break;
+				block.push(next);
+				i += 1;
+			}
+			const indent = Math.min(
+				...block.filter((part) => part.trim()).map((part) => part.search(/\S/)),
+			);
+			value = block
+				.map((part) => part.slice(Number.isFinite(indent) ? indent : 0))
+				.join("\n");
+			if (folded) value = value.replace(/([^\n])\n([^\n])/g, "$1 $2");
+			value = value.trim();
+		}
 		if (key && value) {
 			metadata[key] = value;
 		}

@@ -68,6 +68,34 @@ describe("skills", () => {
 		}
 	});
 
+	it("parses folded and literal multiline descriptions", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-skill-yaml-"));
+		const skillsRoot = path.join(root, ".agents", "skills");
+		const folded = path.join(skillsRoot, "folded");
+		const literal = path.join(skillsRoot, "literal");
+		await mkdir(folded, { recursive: true });
+		await mkdir(literal, { recursive: true });
+		await writeFile(
+			path.join(folded, "SKILL.md"),
+			"---\nname: folded\ndescription: >-\n  First line\n  second line\n---\nBody",
+		);
+		await writeFile(
+			path.join(literal, "SKILL.md"),
+			"---\nname: literal\ndescription: |\n  First line\n  second line\n---\nBody",
+		);
+		try {
+			const skills = await loadCustomSkills(root, path.join(root, "home"));
+			expect(skills.find((skill) => skill.name === "folded")?.description).toBe(
+				"First line second line",
+			);
+			expect(skills.find((skill) => skill.name === "literal")?.description).toBe(
+				"First line\nsecond line",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("follows directory and file links once, skips dangling links and cycles", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-skill-links-"));
 		const home = path.join(root, "home");

@@ -131,6 +131,12 @@ BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全�
 - 原 `acp-cursor`（`cursor-agent acp`）保持不变，两者并存。
 - SDK 凭据不写进 `customAgents.env`：在 host 上用 `cursor-acp login` 或持久的 `CURSOR_API_KEY` 提供。
 
+**配置后自检（避免技能发现踩坑）**：`nativeSkillRoots` 欠配时 BB 不报错，只是技能/命令菜单为空。配置保存后：
+
+1. 确认每个声明的根真实存在且有内容：`find ~/.agents/skills ~/.cursor/skills-cursor -maxdepth 2 -name SKILL.md | head`——输出为空说明根配错了，换成机器上实际有技能的目录（`.agents` 标准根优先；不要为了填空去列 `.claude`/`.codex` 等平行目录，那会造成重复发现）。
+2. 在 BB 任一项目里打开 Cursor (SDK) 线程，输入 `/`：技能菜单应包含 `.agents` 根下的技能（非空即通过）。
+3. Tools → Skills 面板里确认 Cursor (SDK) 分组非空：面板按扫描到的文件路径跨 provider 去重、先注册的 provider 先得，共享根（如 `.agents/skills`）的技能可能归属给更早注册的 provider——所以配方里才额外声明其他 provider 不会扫的 `.cursor/skills-cursor`，保证这个分组永远有自己的 user 技能。
+
 ### 另一台机器
 
 ```bash
@@ -154,6 +160,7 @@ nub run build
 
 # 4. BB 配置：customAgents 一项指向上一步构建出的入口绝对路径（见上一节 JSON）
 #    设置保存后该 provider 立即出现在 BB 的 provider 列表
+#    配置后按上一节“配置后自检”验证技能发现非空，再交付使用
 
 # 5. 可选自检：按本节"验证命令"跑一遍，确认拉取到的聚合可复现
 nub run check && nub run test:run

@@ -115,7 +115,8 @@ BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全�
       "steeringMode": "auto",
       "nativeSkillRoots": {
         "user": [
-          {"path": ".agents/skills", "recursive": true}
+          {"path": ".agents/skills", "recursive": true},
+          {"path": ".cursor/skills-cursor", "recursive": true}
         ],
         "project": [
           {"path": ".agents/skills", "recursive": true, "ancestors": true}

@@ -223,6 +223,7 @@ export class CursorSdkRunner implements CursorRunner {
 					options.modelCatalog,
 					options.thinkingLevel,
 					options.fastValue,
+					(message) => this.logger.warn?.(message),
 				),
 				...(options.modeId === "plan" ? { mode: "plan" as const } : {}),
 				...(sdkMcpServers(options.mcpServers)
@@ -254,6 +255,7 @@ export class CursorSdkRunner implements CursorRunner {
 				return { events, resultEvent, stderr, exitCode: 0 };
 			}
 			const run = sendOutcome.value;
+			this.logger.log?.("[cursor-acp] SDK run model:", run.model);
 			hooks.setCancelRun(() => run.cancel());
 			const streamCompleted = (async () => {
 				for await (const message of run.stream()) {
@@ -437,6 +439,7 @@ export class CursorSdkRunner implements CursorRunner {
 				options.modelCatalog,
 				options.thinkingLevel,
 				options.fastValue,
+				(message) => this.logger.warn?.(message),
 			),
 			local: buildLocalAgentOptions(options.workspace, config.autoReview),
 			...(config.ask ? { tools: [] } : {}),

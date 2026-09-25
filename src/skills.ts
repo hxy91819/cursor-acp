@@ -87,7 +87,7 @@ async function collectSkillFiles(
 		}
 	}
 	// A directory with SKILL.md is one skill; supporting examples inside it are not separate skills.
-	if (!classified.some((item) => item?.isSkillFile)) {
+	if (depth === 0 || !classified.some((item) => item?.isSkillFile)) {
 		const children = classified
 			.filter((item) => item?.isDirectory)
 			.map((item) => item!.fullPath);
@@ -170,7 +170,7 @@ function parseFrontmatter(markdown: string): {
 			value = block
 				.map((part) => part.slice(Number.isFinite(indent) ? indent : 0))
 				.join("\n");
-			if (folded) value = value.replace(/([^\n])\n([^\n])/g, "$1 $2");
+			if (folded) value = value.replace(/(?<=\S)\n(?=\S)/g, " ");
 			value = value.trim();
 		}
 		if (key && value) {

@@ -77,7 +77,7 @@ describe("skills", () => {
 		await mkdir(literal, { recursive: true });
 		await writeFile(
 			path.join(folded, "SKILL.md"),
-			"---\nname: folded\ndescription: >-\n  First line\n  second line\n---\nBody",
+			"---\nname: folded\ndescription: >-\n  A\n  B\n  C\n---\nBody",
 		);
 		await writeFile(
 			path.join(literal, "SKILL.md"),
@@ -85,12 +85,26 @@ describe("skills", () => {
 		);
 		try {
 			const skills = await loadCustomSkills(root, path.join(root, "home"));
-			expect(skills.find((skill) => skill.name === "folded")?.description).toBe(
-				"First line second line",
-			);
+			expect(skills.find((skill) => skill.name === "folded")?.description).toBe("A B C");
 			expect(skills.find((skill) => skill.name === "literal")?.description).toBe(
 				"First line\nsecond line",
 			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("loads child skills when a skill root also contains SKILL.md", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-skill-root-"));
+		const skillsRoot = path.join(root, ".agents", "skills");
+		const child = path.join(skillsRoot, "child");
+		await mkdir(child, { recursive: true });
+		await writeFile(path.join(skillsRoot, "SKILL.md"), "---\nname: root-skill\n---\nRoot body");
+		await writeFile(path.join(child, "SKILL.md"), "---\nname: child-skill\n---\nChild body");
+		try {
+			expect(
+				(await loadCustomSkills(root, path.join(root, "home"))).map((skill) => skill.name),
+			).toEqual(["child-skill", "root-skill"]);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

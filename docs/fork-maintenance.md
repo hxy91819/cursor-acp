@@ -102,40 +102,13 @@ nub run build    # tsc，产物到 dist/
 
 ### 本机（/data/code/cursor-acp）
 
-BB 通过 `customAgents` 接入聚合根目录构建出的入口，不使用全局 `npm link`——"聚合在哪、BB 用的就是哪份"一目了然。`nativeSkillRoots` 统一按 `.agents` 标准单根配置（owner 决定，2026-09-24）：只列 `.agents/skills`（`recursive`，project 侧加 `ancestors`），不配 `.cursor`/`.claude`/`.codex` 多族根，避免对平行目录/符号链接农场的重复发现：
-
-```json
-{
-  "customAgents": [
-    {
-      "id": "cursor-sdk",
-      "displayName": "Cursor (SDK)",
-      "command": "node",
-      "args": ["/data/code/cursor-acp/dist/index.js"],
-      "steeringMode": "auto",
-      "nativeSkillRoots": {
-        "user": [
-          {"path": ".agents/skills", "recursive": true},
-          {"path": ".cursor/skills-cursor", "recursive": true}
-        ],
-        "project": [
-          {"path": ".agents/skills", "recursive": true, "ancestors": true}
-        ]
-      }
-    }
-  ]
-}
-```
+BB 通过 `customAgents` 接入聚合根目录构建出的 `/data/code/cursor-acp/dist/index.js`，不使用全局 `npm link`。当前 `nativeSkillRoots` 配置、目录分工和实测步骤统一见 [环境发现](environment-discovery.md)。
 
 - 重新聚合（`--promote`）后必须再跑一次 `nub install && nub run build`，BB 才会用上新版本；BB 设置变更即时生效，不需要重启。
 - 原 `acp-cursor`（`cursor-agent acp`）保持不变，两者并存。
 - SDK 凭据不写进 `customAgents.env`：在 host 上用 `cursor-acp login` 或持久的 `CURSOR_API_KEY` 提供。
 
-**配置后自检（避免技能发现踩坑）**：`nativeSkillRoots` 欠配时 BB 不报错，只是技能/命令菜单为空。配置保存后：
-
-1. 确认每个声明的根真实存在且有内容：`find ~/.agents/skills ~/.cursor/skills-cursor -maxdepth 2 -name SKILL.md | head`——输出为空说明根配错了，换成机器上实际有技能的目录（`.agents` 标准根优先；不要为了填空去列 `.claude`/`.codex` 等平行目录，那会造成重复发现）。
-2. 在 BB 任一项目里打开 Cursor (SDK) 线程，输入 `/`：技能菜单应包含 `.agents` 根下的技能（非空即通过）。
-3. Tools → Skills 面板里确认 Cursor (SDK) 分组非空：面板按扫描到的文件路径跨 provider 去重、先注册的 provider 先得，共享根（如 `.agents/skills`）的技能可能归属给更早注册的 provider——所以配方里才额外声明其他 provider 不会扫的 `.cursor/skills-cursor`，保证这个分组永远有自己的 user 技能。
+配置后按[环境发现的验证方法](environment-discovery.md#验证方法)分别检查 BB 菜单与 SDK 模型上下文；菜单非空本身不构成完成证据。
 
 ### 另一台机器
 
@@ -158,9 +131,9 @@ nub run build
 ./node_modules/.bin/cursor-acp login   # 或 node dist/index.js login
 # 凭据落在 ~/.cursor/sdk/auth.json，与 cursor-agent login 相互独立
 
-# 4. BB 配置：customAgents 一项指向上一步构建出的入口绝对路径（见上一节 JSON）
+# 4. BB 配置：customAgents 指向上一步构建出的入口绝对路径（配置见 docs/environment-discovery.md）
 #    设置保存后该 provider 立即出现在 BB 的 provider 列表
-#    配置后按上一节“配置后自检”验证技能发现非空，再交付使用
+#    按环境发现文档分别验证菜单和模型上下文，再交付使用
 
 # 5. 可选自检：按本节"验证命令"跑一遍，确认拉取到的聚合可复现
 nub run check && nub run test:run

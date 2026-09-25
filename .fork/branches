@@ -10,3 +10,4 @@ fork-tooling          internal                                          # fork �
 feature/cursor-sdk-1-0-32 pr-open    https://github.com/raphaelluethy/cursor-acp/pull/3 # 升级 Cursor SDK 至 1.0.32 并适配署名补丁
 feature/mid-turn-steering pr-open https://github.com/raphaelluethy/cursor-acp/pull/4 # 叠在 feature/cursor-sdk-1-0-32 上；支持 Cursor SDK 文本 steer
 feature/skill-discovery needs-feedback # 技能发现与调用、全局规则和自动技能清单
+feature/model-parameters needs-feedback # SDK 模型参数透传与按线程选择 1M 上下文

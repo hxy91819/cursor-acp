@@ -819,7 +819,8 @@ export class CursorAcpAgent implements Agent {
 						slash.command,
 						slash.args,
 						session.customSlashCommands,
-					) ?? resolveSkillSlashCommandPrompt(slash.command, session.customSkills);
+					) ??
+					resolveSkillSlashCommandPrompt(slash.command, slash.args, session.customSkills);
 				if (customPrompt) {
 					promptText = customPrompt;
 				}
@@ -1171,7 +1172,7 @@ export class CursorAcpAgent implements Agent {
 	private async loadSessionSlashExtensions(session: SessionState): Promise<void> {
 		const [customSlashCommands, customSkills] = await Promise.allSettled([
 			loadCustomSlashCommands(session.cwd),
-			loadCustomSkills(session.cwd),
+			loadCustomSkills(session.cwd, undefined, this.logger),
 		]);
 
 		if (customSlashCommands.status === "fulfilled") {

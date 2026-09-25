@@ -80,6 +80,7 @@ The same notice is linked from [`docs/breaking-changes.md`](docs/breaking-change
 | `/logout` | Sign out of Cursor                     |
 
 Project and user slash commands/skills discovered by the adapter are added to the ACP command list.
+Skills in `.agents/skills` and `.cursor/skills` may be linked directories or files. Project skills are discovered from the session directory up to its Git root. Invoking `/skill-name request` sends the skill text, its resolved file path, and the request to Cursor.
 
 ## Installation
 

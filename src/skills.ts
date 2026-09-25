@@ -1,6 +1,10 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Logger } from "./utils.js";
+
+const MAX_SKILL_DEPTH = 8;
+const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", ".worktrees", "dist", "build"]);
 
 export type SkillOrigin = "workspace" | "user" | "cursor";
 
@@ -12,38 +16,103 @@ export interface CustomSkill {
 	origin: SkillOrigin;
 }
 
-async function collectSkillFiles(dir: string): Promise<string[]> {
+async function collectSkillFiles(
+	dir: string,
+	seen: Set<string>,
+	warn: (message: string, error: unknown) => void,
+	depth = 0,
+): Promise<string[]> {
+	if (depth > MAX_SKILL_DEPTH) return [];
+	let realDir: string;
+	try {
+		realDir = await fs.realpath(dir);
+	} catch (error) {
+		if (!isMissing(error)) warn(`Unable to resolve skill directory ${dir}`, error);
+		return [];
+	}
+	if (seen.has(realDir)) return [];
+	seen.add(realDir);
 	let entries: import("node:fs").Dirent[];
 	try {
 		entries = await fs.readdir(dir, { withFileTypes: true, encoding: "utf8" });
 	} catch (error: unknown) {
-		if (
-			typeof error === "object" &&
-			error !== null &&
-			"code" in error &&
-			(error as { code?: string }).code === "ENOENT"
-		) {
-			return [];
-		}
-		throw error;
+		if (!isMissing(error)) warn(`Unable to read skill directory ${dir}`, error);
+		return [];
 	}
 
 	entries.sort((a, b) => a.name.localeCompare(b.name));
 
+	const classified = await Promise.all(
+		entries.map(async (entry) => {
+			const fullPath = path.join(dir, entry.name);
+			let isDirectory = entry.isDirectory();
+			let isFile = entry.isFile();
+			if (entry.isSymbolicLink()) {
+				try {
+					const target = await fs.stat(fullPath);
+					isDirectory = target.isDirectory();
+					isFile = target.isFile();
+				} catch (error) {
+					if (!isMissing(error)) warn(`Unable to follow skill link ${fullPath}`, error);
+					return null;
+				}
+			}
+			return {
+				fullPath,
+				isDirectory: isDirectory && !SKIPPED_DIRECTORIES.has(entry.name),
+				isSkillFile: isFile && entry.name.toLowerCase() === "skill.md",
+			};
+		}),
+	);
 	const files: string[] = [];
-	for (const entry of entries) {
-		const fullPath = path.join(dir, entry.name);
-		if (entry.isDirectory()) {
-			files.push(...(await collectSkillFiles(fullPath)));
-			continue;
+	for (const item of classified) {
+		if (!item?.isSkillFile) continue;
+		try {
+			const realFile = await fs.realpath(item.fullPath);
+			if (!seen.has(realFile)) {
+				seen.add(realFile);
+				files.push(realFile);
+			}
+		} catch (error) {
+			if (!isMissing(error)) warn(`Unable to resolve skill file ${item.fullPath}`, error);
 		}
-
-		if (entry.isFile() && entry.name.toLowerCase() === "skill.md") {
-			files.push(fullPath);
+	}
+	// A directory with SKILL.md is one skill; supporting examples inside it are not separate skills.
+	if (!classified.some((item) => item?.isSkillFile)) {
+		const children = classified
+			.filter((item) => item?.isDirectory)
+			.map((item) => item!.fullPath);
+		for (const child of children) {
+			files.push(...(await collectSkillFiles(child, seen, warn, depth + 1)));
 		}
 	}
 
 	return files;
+}
+
+function isMissing(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error as { code?: string }).code === "ENOENT"
+	);
+}
+
+async function workspaceDirectories(workspace: string): Promise<string[]> {
+	const directories = [path.resolve(workspace)];
+	let current = directories[0]!;
+	while (path.dirname(current) !== current) {
+		try {
+			await fs.stat(path.join(current, ".git"));
+			return directories;
+		} catch (error) {
+			if (!isMissing(error)) break;
+		}
+		current = path.dirname(current);
+		directories.push(current);
+	}
+	return [directories[0]!];
 }
 
 function parseFrontmatter(markdown: string): {
@@ -135,10 +204,13 @@ async function readSkill(filePath: string, origin: SkillOrigin): Promise<CustomS
 export async function loadCustomSkills(
 	workspace: string,
 	homeDirectory: string = os.homedir(),
+	logger: Pick<Logger, "warn"> = console,
 ): Promise<CustomSkill[]> {
 	const skillRoots: Array<{ root: string; origin: SkillOrigin }> = [
-		{ root: path.join(workspace, ".cursor", "skills"), origin: "workspace" },
-		{ root: path.join(workspace, ".agents", "skills"), origin: "workspace" },
+		...(await workspaceDirectories(workspace)).flatMap((directory) => [
+			{ root: path.join(directory, ".cursor", "skills"), origin: "workspace" as const },
+			{ root: path.join(directory, ".agents", "skills"), origin: "workspace" as const },
+		]),
 		{ root: path.join(homeDirectory, ".agents", "skills"), origin: "user" },
 		{ root: path.join(homeDirectory, ".cursor", "skills"), origin: "user" },
 		{
@@ -148,13 +220,17 @@ export async function loadCustomSkills(
 	];
 
 	const byName = new Map<string, CustomSkill>();
+	const seen = new Set<string>();
+	const warn = (message: string, error: unknown) =>
+		logger.warn?.(`[cursor-acp] ${message}`, error);
 	for (const { root, origin } of skillRoots) {
-		const files = await collectSkillFiles(root);
+		const files = await collectSkillFiles(root, seen, warn);
 		for (const file of files) {
 			let skill: CustomSkill | null;
 			try {
 				skill = await readSkill(file, origin);
-			} catch {
+			} catch (error) {
+				if (!isMissing(error)) warn(`Unable to read skill file ${file}`, error);
 				continue;
 			}
 			if (!skill) {
@@ -170,7 +246,11 @@ export async function loadCustomSkills(
 	return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function resolveSkillPrompt(commandName: string, skills: CustomSkill[]): string | null {
+export function resolveSkillPrompt(
+	commandName: string,
+	args: string,
+	skills: CustomSkill[],
+): string | null {
 	const normalized = commandName.toLowerCase();
 	const stripped = normalized.startsWith("skill:")
 		? normalized.slice("skill:".length)
@@ -180,5 +260,7 @@ export function resolveSkillPrompt(commandName: string, skills: CustomSkill[]): 
 				? normalized.slice("skills/".length)
 				: normalized;
 	const match = skills.find((skill) => skill.name.toLowerCase() === stripped);
-	return match?.template ?? null;
+	if (!match) return null;
+	const prompt = `Skill file: ${match.sourcePath}\nSkill directory: ${path.dirname(match.sourcePath)}\n\n${match.template}`;
+	return args.trim() ? `${prompt}\n\n${args.trim()}` : prompt;
 }

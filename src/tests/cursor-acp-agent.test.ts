@@ -695,12 +695,12 @@ describe("CursorAcpAgent", () => {
 			});
 			await agent.prompt({
 				sessionId: session.sessionId,
-				prompt: [{ type: "text", text: "/workspace-skill" }],
+				prompt: [{ type: "text", text: "/workspace-skill inspect deck.html" }],
 			});
 
 			expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
 				"Review these changes: src",
-				"Skill body",
+				`Skill file: ${path.join(workspace, ".cursor", "skills", "workspace-skill", "SKILL.md")}\nSkill directory: ${path.join(workspace, ".cursor", "skills", "workspace-skill")}\n\nSkill body\n\ninspect deck.html`,
 			]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
@@ -832,7 +832,7 @@ describe("CursorAcpAgent", () => {
 		await expect(
 			Promise.race([
 				newSessionPromise.then((session) => session.models?.currentModelId),
-				new Promise((resolve) => setTimeout(() => resolve("blocked"), 20)),
+				new Promise((resolve) => setTimeout(() => resolve("blocked"), 200)),
 			]),
 		).resolves.toBe("auto");
 		expect(backends).toHaveLength(0);

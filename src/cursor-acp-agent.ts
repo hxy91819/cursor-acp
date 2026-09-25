@@ -769,8 +769,11 @@ export class CursorAcpAgent implements Agent {
 		const promptImages = promptToCursorImages(params);
 
 		const slash = parseLeadingSlashCommand(promptText);
+		const skillPrompt = slash.hasSlash
+			? resolveSkillSlashCommandPrompt(slash.command, slash.args, session.customSkills)
+			: null;
 		if (slash.hasSlash) {
-			if (!this.hasNativeSlashCommand(session, slash.command)) {
+			if (skillPrompt || !this.hasNativeSlashCommand(session, slash.command)) {
 				const handled = await handleSlashCommand(slash.command, slash.args, {
 					session,
 					auth: this.auth,
@@ -819,8 +822,7 @@ export class CursorAcpAgent implements Agent {
 						slash.command,
 						slash.args,
 						session.customSlashCommands,
-					) ??
-					resolveSkillSlashCommandPrompt(slash.command, slash.args, session.customSkills);
+					) ?? skillPrompt;
 				if (customPrompt) {
 					promptText = customPrompt;
 				}

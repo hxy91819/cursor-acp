@@ -693,6 +693,9 @@ describe("CursorAcpAgent", () => {
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "/review-local src" }],
 			});
+			agentTestAccess(agent).sessions[session.sessionId].nativeAvailableCommands = [
+				{ name: "workspace-skill", description: "Native skill", input: null },
+			];
 			await agent.prompt({
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "/workspace-skill inspect deck.html" }],

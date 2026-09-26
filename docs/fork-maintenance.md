@@ -41,6 +41,7 @@ git worktree add .worktrees/<name> -b feature/<name> "$base"   # 修复用 fix/<
 - 只有真正依赖另一个 fork 分支时，才从那个分支拉出（叠放），并在清单说明里写"叠在 X 上"。
 - 修改已有功能：直接在它的分支上继续提交。分支落后于基线也没关系，merge 会处理；只有冲突时才 rebase。
 - 完成后：相关测试通过 → 提交 → `git push fork <branch>` 并核对远端 SHA。
+- 上游 `.gitignore` 忽略整个 `docs/`：新增文档用 `git add -f`，修改已跟踪文档用 `git add -u`，否则文档不会进入提交。
 - 在 `fork-tooling` 分支的 `.fork/branches` 加一行（分支、上游状态、说明），提交并推送 `fork-tooling`。
 
 ## 2. 聚合打包

@@ -49,6 +49,8 @@ BB 对不存在的技能根可能只给出空菜单，不另报配置错误。To
      python3 -c 'import json,sys; commands=json.load(sys.stdin)["commands"]; print(sum(item["source"]=="skill" for item in commands))'
    ```
 
+   菜单还包含 BB 插件自带的技能（条目带非空 `pluginId`，如 `automations`、`thread-list`），它们由 BB 提供，不经 cursor-acp，所以菜单总数会多于第 5 步的适配器数量。两边按技能名比较：适配器加载的每个技能都应出现在菜单里，菜单多出的只能是带 `pluginId` 的条目。
+
 3. 在 BB 的 Cursor (SDK) 上固定 `composer-2.5`，发最短真调用：`不读文件。按你已收到的全局规则，用户引用的技能不在技能列表时，依次查哪两个目录？只回复路径。` 期望依次得到 `~/.agents/skills/<name>/` 和当前仓库 `.agents/skills/<name>/`。
 4. 再发：`不读文件。仅根据你收到的额外自动发现技能清单，回复 tdd 的 SKILL.md 绝对路径；再写 ppt-visual-review 是否在这份清单中。` 期望有 `tdd` 的真实绝对路径，且 `ppt-visual-review` 没有清单条目。判断自动发现时只问允许自动发现的技能；不能用模型是否“看见”禁用自动调用的技能来判定故障。
 5. 离线检查适配器实际加载的技能。数量应与去重后的有效技能目录对应，且包含软链接目标：

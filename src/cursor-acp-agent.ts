@@ -83,6 +83,7 @@ import {
 	resolveModelId,
 	THINKING_PARAM_ID,
 	withCliModelParameters,
+	withContextModelVariants,
 } from "./model-id.js";
 import {
 	parseLeadingSlashCommand,
@@ -1029,7 +1030,10 @@ export class CursorAcpAgent implements Agent {
 			const handled = await handleSlashCommand(slash.command, slash.args, {
 				session,
 				auth: this.auth,
-				listModels: async () => await this.runner.listModels(),
+				listModels: async () =>
+					withContextModelVariants(
+						withCliModelParameters(await this.runner.listModels()),
+					),
 				availableCommands: this.availableCommandsForSession(session),
 				onModeChanged: async (modeId) => {
 					await this.applySessionMode(session, modeId);
@@ -1682,16 +1686,18 @@ export class CursorAcpAgent implements Agent {
 				this.logger.warn?.("[cursor-acp] Unable to refresh the full model list", error);
 			}
 
-			const modelCatalog = withCliModelParameters(
-				mergeModelCatalogs(
-					listedModels.length > 0
-						? listedModels
-						: loaded.models.availableModels.map((model) => ({
-								modelId: normalizeModelId(model.modelId),
-								name: model.name,
-								current: loaded.models?.currentModelId === model.modelId,
-							})),
-					session.modelCatalog,
+			const modelCatalog = withContextModelVariants(
+				withCliModelParameters(
+					mergeModelCatalogs(
+						listedModels.length > 0
+							? listedModels
+							: loaded.models.availableModels.map((model) => ({
+									modelId: normalizeModelId(model.modelId),
+									name: model.name,
+									current: loaded.models?.currentModelId === model.modelId,
+								})),
+						session.modelCatalog,
+					),
 				),
 			);
 			session.modelCatalog = modelCatalog;
@@ -1884,7 +1890,9 @@ export class CursorAcpAgent implements Agent {
 			this.logger.error("[cursor-acp] Unable to list models", error);
 		}
 
-		listed = withCliModelParameters(mergeModelCatalogs(listed, session.modelCatalog));
+		listed = withContextModelVariants(
+			withCliModelParameters(mergeModelCatalogs(listed, session.modelCatalog)),
+		);
 		session.modelCatalog = listed;
 
 		const configuredModelId = resolveModelId(session.configuredModelId, listed);

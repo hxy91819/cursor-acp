@@ -70,7 +70,7 @@ fi
 
 for branch in "${branches[@]}"; do
   ref="$(resolve_ref "$branch")"
-  if git -C "$wt" merge --quiet --no-ff --no-edit -m "Merge $branch" "$ref" >/dev/null 2>&1; then
+  if git -C "$wt" merge --quiet --no-autostash --no-ff --no-edit -m "Merge $branch" "$ref" >/dev/null 2>&1; then
     echo "merged   $branch"
     continue
   fi

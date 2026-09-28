@@ -42,6 +42,7 @@ git worktree add .worktrees/<name> -b feature/<name> "$base"   # 修复用 fix/<
 - 修改已有功能：直接在它的分支上继续提交。分支落后于基线也没关系，merge 会处理；只有冲突时才 rebase。
 - 完成后：相关测试通过 → 提交 → `git push fork <branch>` 并核对远端 SHA。
 - 上游 `.gitignore` 忽略整个 `docs/`：新增文档用 `git add -f`，修改已跟踪文档用 `git add -u`，否则文档不会进入提交。
+- 依赖安全修复（当前为 `fix/vite-ghsa-p9ff-h696-f583` 固定的 Vite 传递依赖）只存在于修复分支和聚合产物；从早于该修复的 `base` tag 新建的 worktree 会重新解析到受影响版本。在这类 worktree 里安装依赖前，先把对应修复分支的 `package.json`/`nub.lock` 变更应用进来，安装后再 `nub prune` 清掉旧版本副本。
 - 在 `fork-tooling` 分支的 `.fork/branches` 加一行（分支、上游状态、说明），提交并推送 `fork-tooling`。
 
 ## 2. 聚合打包

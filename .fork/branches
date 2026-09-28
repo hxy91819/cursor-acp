@@ -13,3 +13,4 @@ fix/cancel-config-sync needs-feedback # 叠在 feature/mid-turn-steering 上；�
 feature/skill-discovery needs-feedback # 技能发现与调用、全局规则和自动技能清单
 feature/model-parameters needs-feedback # SDK 模型参数透传与按线程选择 1M 上下文
 fix/model-discovery-errors needs-feedback # 模型发现失败或空目录明确报错，避免缓存 Auto 兜底目录
+fix/vite-ghsa-p9ff-h696-f583 needs-feedback # Vitest 传递依赖 Vite 固定到已修复的 7.x（CVE-2026-39363）

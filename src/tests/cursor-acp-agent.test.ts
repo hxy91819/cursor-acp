@@ -21,7 +21,12 @@ import {
 import { CursorAcpAgent } from "../cursor-acp-agent.js";
 import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { RunPromptOptions } from "../cursor-cli-runner.js";
-import { recordAssistantMessage, recordUserMessage } from "../session-storage.js";
+import {
+	recordAssistantMessage,
+	recordSessionMeta,
+	recordUserMessage,
+} from "../session-storage.js";
+import type { BbPermissionMode } from "../settings.js";
 import type { CursorModelDescriptor } from "../slash-commands.js";
 import {
 	agentTestAccess,
@@ -245,6 +250,7 @@ function createAgentTestHarness(
 		createSessionBlocker?: Promise<void>;
 		createSessionBlockers?: Array<Promise<void> | undefined>;
 		models?: CursorModelDescriptor[];
+		bbPermissionMode?: BbPermissionMode;
 	} = {},
 ) {
 	const backends: FakeNativeBackend[] = [];
@@ -304,6 +310,7 @@ function createAgentTestHarness(
 	};
 
 	const agent = new CursorAcpAgent(client, {
+		bbPermissionMode: backendOptions.bbPermissionMode,
 		auth: {
 			async status() {
 				return { loggedIn: true as const, account: "u@e", raw: "" };
@@ -419,6 +426,54 @@ afterEach(async () => {
 });
 
 describe("CursorAcpAgent", () => {
+	it("uses BB permission mode for new and restored agent sessions while preserving ask and plan", async () => {
+		const full = createAgentTestHarness({ bbPermissionMode: "full" });
+		await full.agent.initialize(initRequest());
+		const newSession = await full.agent.newSession(
+			newSessionRequest({ cwd: "/tmp/bb-permission" }),
+		);
+		expect(newSession.modes?.currentModeId).toBe("yolo");
+		await full.agent.prompt({
+			sessionId: newSession.sessionId,
+			prompt: [{ type: "text", text: "hi" }],
+		});
+		expect(full.legacyPromptCalls[full.legacyPromptCalls.length - 1]?.reviewPolicy).toBe(
+			"run-everything",
+		);
+
+		await recordUserMessage("/tmp/bb-permission", "bb-restored", "prior prompt");
+		await recordSessionMeta("/tmp/bb-permission", "bb-restored", { modeId: "yolo" });
+		const restricted = createAgentTestHarness({ bbPermissionMode: "accept-edits" });
+		await restricted.agent.initialize(initRequest());
+		const restrictedNew = await restricted.agent.newSession(
+			newSessionRequest({ cwd: "/tmp/bb-permission" }),
+		);
+		expect(restrictedNew.modes?.currentModeId).toBe("accept-edits");
+		const restored = await restricted.agent.loadSession({
+			sessionId: "bb-restored",
+			cwd: "/tmp/bb-permission",
+		});
+		expect(restored.modes?.currentModeId).toBe("accept-edits");
+		await restricted.agent.prompt({
+			sessionId: "bb-restored",
+			prompt: [{ type: "text", text: "hi" }],
+		});
+		expect(
+			restricted.legacyPromptCalls[restricted.legacyPromptCalls.length - 1]?.reviewPolicy,
+		).toBe("workspace-sandbox");
+		await expect(
+			restricted.agent.setSessionMode({ sessionId: "bb-restored", modeId: "yolo" }),
+		).rejects.toThrow();
+
+		await recordUserMessage("/tmp/bb-permission", "bb-plan", "prior prompt");
+		await recordSessionMeta("/tmp/bb-permission", "bb-plan", { modeId: "plan" });
+		const plan = await restricted.agent.unstable_resumeSession({
+			sessionId: "bb-plan",
+			cwd: "/tmp/bb-permission",
+			mcpServers: [],
+		});
+		expect(plan.modes?.currentModeId).toBe("plan");
+	});
 	it("handles adapter slash commands without invoking native prompt", async () => {
 		const { agent, client, legacyPromptCalls } = createAgentTestHarness();
 
@@ -932,6 +987,7 @@ describe("CursorAcpAgent", () => {
 		expect(session.modes?.currentModeId).toBe("auto-review");
 		expect(session.modes?.availableModes?.map((mode) => mode.id)).toEqual([
 			"auto-review",
+			"accept-edits",
 			"yolo",
 			"ask",
 			"plan",

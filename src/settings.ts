@@ -1,10 +1,10 @@
 export const ADAPTER_NAME = "cursor-acp";
 
-export const ADVERTISED_MODE_IDS = ["auto-review", "yolo", "ask", "plan"] as const;
+export const ADVERTISED_MODE_IDS = ["auto-review", "accept-edits", "yolo", "ask", "plan"] as const;
 
 export const LEGACY_MODE_ALIASES = {
 	default: "auto-review",
-	acceptEdits: "auto-review",
+	acceptEdits: "accept-edits",
 	agent: "auto-review",
 	autoReview: "auto-review",
 } as const;
@@ -12,10 +12,33 @@ export const LEGACY_MODE_ALIASES = {
 type AdvertisedModeId = (typeof ADVERTISED_MODE_IDS)[number];
 export type SessionModeId = "default" | AdvertisedModeId;
 
-export type AgentSessionModeId = Extract<SessionModeId, "default" | "auto-review" | "yolo">;
+export type AgentSessionModeId = Extract<
+	SessionModeId,
+	"default" | "auto-review" | "accept-edits" | "yolo"
+>;
 
 export function isAgentSessionMode(modeId: SessionModeId): modeId is AgentSessionModeId {
-	return modeId === "default" || modeId === "auto-review" || modeId === "yolo";
+	return (
+		modeId === "default" ||
+		modeId === "auto-review" ||
+		modeId === "accept-edits" ||
+		modeId === "yolo"
+	);
+}
+
+export type BbPermissionMode = "full" | "accept-edits";
+
+export function parseBbPermissionMode(args: readonly string[]): BbPermissionMode | undefined {
+	const flags = args.filter((arg) => arg.startsWith("--bb-permission-mode="));
+	if (flags.length === 0) return undefined;
+	if (flags.length !== 1) throw new Error("Duplicate --bb-permission-mode argument");
+	const value = flags[0]!.slice("--bb-permission-mode=".length);
+	if (value === "full" || value === "accept-edits") return value;
+	throw new Error(`Invalid BB permission mode: ${value}`);
+}
+
+export function bbPermissionSessionMode(mode: BbPermissionMode): AgentSessionModeId {
+	return mode === "full" ? "yolo" : "accept-edits";
 }
 
 export const DEFAULT_MODE_ID: SessionModeId = "auto-review";
@@ -66,6 +89,8 @@ export function modeDisplayName(modeId: SessionModeId): string {
 			return "Default (Auto-review)";
 		case "auto-review":
 			return "Auto-review";
+		case "accept-edits":
+			return "Accept edits";
 		case "yolo":
 			return "Yolo";
 		case "ask":
@@ -84,6 +109,11 @@ export function availableModes(currentModeId: SessionModeId) {
 				name: "Auto-review",
 				description:
 					"Cursor Smart Auto Review runs approved tool calls and fails closed on the rest",
+			},
+			{
+				id: "accept-edits",
+				name: "Accept edits",
+				description: "Run inside Cursor's local sandbox without Smart Auto Review",
 			},
 			{
 				id: "yolo",

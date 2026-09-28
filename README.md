@@ -66,6 +66,20 @@ Older builds accepted `bypassPermissions` and `autoRunAllCommands` as synonyms f
 - **What it does**: Creates/resumes the local SDK agent with Auto Review disabled. This is the SDK's headless “run everything” behavior.
 - **Configuration**: Set `default_config_options.mode` to `yolo` or choose Yolo in the mode picker. Do not use removed aliases such as `bypassPermissions` or `autoRunAllCommands`.
 
+### BB permission mode
+
+BB's ACP `permissionCli` can pass its permission choice at process launch:
+
+```json
+"permissionCli": {
+  "full": ["--bb-permission-mode=full"],
+  "workspaceWrite": ["--bb-permission-mode=accept-edits"],
+  "insertAfterArgs": 1
+}
+```
+
+Use `insertAfterArgs: 1` when the agent command is `node` and its first argument is `dist/index.js`. BB Full Access starts Cursor in Yolo with Auto Review and the local sandbox disabled. BB Accept Edits starts Cursor with the local sandbox enabled and Auto Review disabled. Cursor Smart Auto Review is a separate mode with classifier decisions; it does not implement BB Accept Edits. Restoring a session applies BB's current permission choice to agent mode while keeping Ask and Plan modes. A running BB ACP bridge must rebuild the session after a permission change so the next turn receives new launch arguments.
+
 The same notice is linked from [`docs/breaking-changes.md`](docs/breaking-changes.md).
 
 ## Slash Commands
@@ -200,7 +214,7 @@ Zed versions with ACP config defaults apply initial controls from `default_confi
 }
 ```
 
-- `mode` — one of `auto-review`, `yolo`, `plan`, or `ask`. Omit it to use the shipped `auto-review` default; legacy `default` values still work as an alias.
+- `mode` — one of `auto-review`, `accept-edits`, `yolo`, `plan`, or `ask`. Omit it to use the shipped `auto-review` default; legacy `default` values still work as an alias.
 - `model` — optional canonical model ID from the Cursor SDK catalog.
 - `fast` — boolean toggle when the selected model advertises a `fast` parameter.
 - `thinking` — ACP config id for the selected model's `thinking`, `reasoning`, or `effort` parameter. For on/off parameters, use `true` or `false`. Multi-level parameters use catalog values (for example `none` / `low` / `medium` / `high` / `xhigh` / `max`, or Effort `low` / `high`). The picker label also comes from the SDK catalog.

@@ -464,6 +464,14 @@ describe("CursorAcpAgent", () => {
 		await expect(
 			restricted.agent.setSessionMode({ sessionId: "bb-restored", modeId: "yolo" }),
 		).rejects.toThrow();
+		await restricted.agent.setSessionMode({ sessionId: "bb-restored", modeId: "auto-review" });
+		await restricted.agent.prompt({
+			sessionId: "bb-restored",
+			prompt: [{ type: "text", text: "reviewed" }],
+		});
+		expect(
+			restricted.legacyPromptCalls[restricted.legacyPromptCalls.length - 1]?.reviewPolicy,
+		).toBe("sandbox-auto-review");
 
 		await recordUserMessage("/tmp/bb-permission", "bb-plan", "prior prompt");
 		await recordSessionMeta("/tmp/bb-permission", "bb-plan", { modeId: "plan" });
@@ -473,6 +481,13 @@ describe("CursorAcpAgent", () => {
 			mcpServers: [],
 		});
 		expect(plan.modes?.currentModeId).toBe("plan");
+		await restricted.agent.prompt({
+			sessionId: "bb-plan",
+			prompt: [{ type: "text", text: "plan" }],
+		});
+		expect(
+			restricted.legacyPromptCalls[restricted.legacyPromptCalls.length - 1]?.reviewPolicy,
+		).toBe("sandbox-auto-review");
 	});
 	it("handles adapter slash commands without invoking native prompt", async () => {
 		const { agent, client, legacyPromptCalls } = createAgentTestHarness();

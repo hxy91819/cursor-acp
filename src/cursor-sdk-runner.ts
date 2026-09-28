@@ -421,7 +421,9 @@ export class CursorSdkRunner implements CursorRunner {
 		const autoReview =
 			options.reviewPolicy !== "run-everything" &&
 			options.reviewPolicy !== "workspace-sandbox";
-		const sandbox = options.reviewPolicy === "workspace-sandbox";
+		const sandbox =
+			options.reviewPolicy === "workspace-sandbox" ||
+			options.reviewPolicy === "sandbox-auto-review";
 		const ask = options.modeId === "ask";
 		return {
 			autoReview,

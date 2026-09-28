@@ -167,6 +167,27 @@ describe("CursorSdkRunner", () => {
 		);
 	});
 
+	it("keeps the sandbox enabled when Auto Review is selected under BB Accept Edits", async () => {
+		const agent = sdkAgent("agent-sandbox-reviewed");
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		await runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "reviewed",
+			reviewPolicy: "sandbox-auto-review",
+		}).completed;
+
+		expect(sdkMocks.agentCreate).toHaveBeenCalledWith(
+			expect.objectContaining({
+				local: expect.objectContaining({
+					autoReview: true,
+					sandboxOptions: { enabled: true },
+				}),
+			}),
+		);
+	});
+
 	it("forwards ACP MCP servers and image chunks to the SDK", async () => {
 		const agent = sdkAgent("agent-real");
 		sdkMocks.agentCreate.mockResolvedValue(agent);

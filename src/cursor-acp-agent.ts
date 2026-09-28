@@ -1873,25 +1873,36 @@ export class CursorAcpAgent implements Agent {
 		forceRetry: boolean,
 	): {
 		modeId?: "plan" | "ask";
-		reviewPolicy: "auto-review" | "workspace-sandbox" | "run-everything";
+		reviewPolicy:
+			| "auto-review"
+			| "sandbox-auto-review"
+			| "workspace-sandbox"
+			| "run-everything";
 	} {
 		if (forceRetry) {
-			return { reviewPolicy: "run-everything" };
+			return {
+				reviewPolicy:
+					this.bbPermissionMode === "accept-edits"
+						? "workspace-sandbox"
+						: "run-everything",
+			};
 		}
+		const reviewPolicy =
+			this.bbPermissionMode === "accept-edits" ? "sandbox-auto-review" : "auto-review";
 
 		switch (session.modeId) {
 			case "plan":
-				return { modeId: "plan", reviewPolicy: "auto-review" };
+				return { modeId: "plan", reviewPolicy };
 			case "ask":
-				return { modeId: "ask", reviewPolicy: "auto-review" };
+				return { modeId: "ask", reviewPolicy };
 			case "yolo":
 				return { reviewPolicy: "run-everything" };
 			case "accept-edits":
 				return { reviewPolicy: "workspace-sandbox" };
 			case "auto-review":
-				return { reviewPolicy: "auto-review" };
+				return { reviewPolicy };
 			case "default":
-				return { reviewPolicy: "auto-review" };
+				return { reviewPolicy };
 			default:
 				unreachable(session.modeId, this.logger);
 		}

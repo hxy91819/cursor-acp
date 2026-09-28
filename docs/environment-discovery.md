@@ -3,9 +3,10 @@
 目录：
 
 1. [原则](#原则)
-2. [分工与当前配置](#分工与当前配置)
-3. [验证方法](#验证方法)
-4. [已知 SDK 缺陷与根因](#已知-sdk-缺陷与根因)
+2. [当前全局提示词方案](#当前全局提示词方案)
+3. [分工与当前配置](#分工与当前配置)
+4. [验证方法](#验证方法)
+5. [已知 SDK 缺陷与根因](#已知-sdk-缺陷与根因)
 
 ## 原则
 
@@ -14,6 +15,16 @@
 所有已加载技能都能用 `/name` 手动调用。只有未设置 `disable-model-invocation: true` 的技能才进入给模型自动发现的补充清单。软链接是正常的组织方式：BB 菜单、cursor-acp 技能加载和全局规则读取都要跟随软链接。
 
 这里的 BB `nativeSkillRoots` 用于 `/` 菜单发现，不能代替 cursor-acp 把规则和技能提供给 SDK 模型。BB 声明的有效技能根应与 cursor-acp 实际加载的根一致；增删目录时同时核对两边。Cursor SDK 没有公开的技能列表接口，不会替适配器展开 `/name` 文本，当前还会漏掉软链接技能。cursor-acp 继续保留自身的加载与调用路径，补齐 SDK 当前的缺口；SDK 修复后再评估精简。
+
+## 当前全局提示词方案
+
+2026-09-28 确认：对当前固定的 Cursor SDK 1.0.32，保留 cursor-acp 的首轮全局提示词注入，作为目前已验证、最适合本项目的兼容方案。暂不为此修改 SDK，也不以项目软链替换注入。
+
+规则正文通过软链维护单一事实源：本机 `~/.agents/AGENTS.md` 指向 `mason-skills/config/user-agents.md`。`src/session-context.ts` 跟随软链读取正文、去除 frontmatter，由适配器放进新 SDK agent 的第一条用户消息；同一 SDK 会话后续轮次不重复注入，恢复会话沿用历史。它属于会话消息上下文，并非 SDK 的原生全局规则或系统提示词。规则正文更新后，需要新建 SDK 会话才能使用更新后的注入内容。
+
+保留该方案的原因是 SDK 不原生发现上述本机全局规则文件，而项目规则指向 workspace 外文件的软链也会被 SDK 过滤；`systemPrompt` 则会完整替换内置提示词，不适合追加用户规则。软链负责正文维护，适配器负责将正文送入模型，两者继续配合使用。
+
+验证边界：以上结论针对本机文件入口与 SDK 1.0.32；本次没有验证 Cursor 账号侧 User Rules 是否生效，不能据此声称 SDK 不读取任何形式的全局规则。SDK 升级后，只有确认原生入口能读取共享正文、跟随外部软链，并在没有适配器注入的真实调用中生效，才重新评估移除兼容逻辑。
 
 ## 分工与当前配置
 
@@ -61,7 +72,19 @@ BB 对不存在的技能根可能只给出空菜单，不另报配置错误。To
 
 ## 已知 SDK 缺陷与根因
 
-- SDK 的 `settingSources: ["user"]` 会读取账号侧用户规则，但不会把 `~/.cursor/rules` 当作用户规则目录。即使加入 `project` 来源，放在该用户目录的真实 `.mdc` 文件也不会进入会话；因此本机软链接链条不是这项缺失的主因。cursor-acp 从 `~/.agents/AGENTS.md` 读取真实正文并放入新 SDK agent 的第一条消息。SDK 1.0.32 虽有 `systemPrompt` 选项，但它会替换整个内置提示词（包括工具使用约定），且受服务端权限限制、resume 时须重传，不适合追加用户规则；首轮消息保留内置提示词，后续轮次不重复，SDK 会话恢复沿用已有历史。
+- SDK 的 `settingSources: ["user"]` 不会把 `~/.cursor/rules` 当作独立的用户规则目录，也不原生加载 `~/.agents/AGENTS.md`。即使加入 `project` 来源，放在该用户目录的真实 `.mdc` 文件也不会进入本项目会话；因此本机软链接链条不是这项缺失的主因。账号侧 User Rules 是否生效不在本次已验证范围内。cursor-acp 按上述方案读取并注入共享正文。SDK 1.0.32 虽有 `systemPrompt` 选项，但它会替换整个内置提示词（包括工具使用约定），且受服务端权限限制、resume 时须重传，不适合追加用户规则。
 - `project` 来源决定真实项目规则与项目技能能否进入 SDK：只启用 `user` 时，真实项目探针不可见；同时启用 `user`、`project` 时可见。cursor-acp 因此启用两者。
 - SDK 自身的 agent skills 列表会漏掉软链接技能。cursor-acp 只补充经过软链接发现、允许自动调用的技能，并排除与实体技能真实路径或名称重复的项；模型匹配任务时再读取对应 `SKILL.md`。SDK 没有公开的完整技能列表接口，因此适配器不能直接从 SDK 取名单做差集。
 - SDK 不解释发往它的 `/name 要求` 文本；cursor-acp 在调用前展开已加载技能，附上文件与目录路径并保留要求。
+
+### SDK 1.0.32 规则软链复核（2026-09-28）
+
+源码与直接 SDK 调用确认，规则发现和规则最终进入模型是两个阶段：
+
+1. `LocalCursorRulesService.loadRulesFromDirAndAncestors` 从工作目录向上查找 `AGENTS.md`、`.cursor/rules/*.mdc` 等文件；`loadRulesFromDirectory` 使用 `followSymlinks: true`。这不等于独立扫描 home 下的全局规则目录。
+2. SDK local extensibility adapter 对规则 `fullPath` 和 workspace roots 调用 `realpath`，只保留真实路径位于允许 workspace roots 内的规则。祖先目录发现的规则、以及指向 workspace 外部的软链，不能仅凭扫描日志判断已经加载。
+3. 对两个隔离目录直接使用 `Agent.create({ model: { id: "composer-2.5" }, tools: [], local: { cwd, settingSources: ["user", "project"] } })`，没有经过 cursor-acp，也没有首轮补充上下文。项目内真实 `.cursor/rules/probe.mdc` 含 `alwaysApply: true` 和随机探针值；另一个项目的同名入口软链到项目外的同内容文件。两个调用日志都是 `ruleCount: 1`，但只有项目内真实文件的会话能回答探针值，外部软链的会话回答 `MISSING`。探针值未写进用户问题。
+
+因此，不能通过在每个项目建立 `.cursor/rules/user-agents.mdc -> ~/.agents/AGENTS.md` 就移除当前注入。共享规则正文仍应通过 `~/.agents/AGENTS.md` 指向唯一事实源维护；要改用 SDK 原生规则上下文，须先解决用户级规则入口与外部软链过滤这两个问题，再验证并移除首轮注入。不要把共享目录加入 `local.dirs` 作为默认修复，这会把配置目录也变成模型的工作区。
+
+`systemPrompt` 是完整替换而非追加规则，见 [Cursor SDK 官方文档](https://cursor.com/docs/sdk/typescript#replacing-the-system-prompt)。它不能直接代替用户规则接入。

@@ -383,7 +383,7 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 			acpSessionId,
 			`请牢记以下口令，稍后我会向你询问：${token}。现在请只回复一个单词“ACK”，不要输出其他任何内容。`,
 		);
-		turn1Reply = turn1Res.reply.trim();
+		turn1Reply = turn1Res.reply;
 		log(`Turn 1 prompt completed. Model reply: ${turn1Reply}`);
 
 		// Verify backend session ID on disk
@@ -449,7 +449,7 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 			acpSessionId,
 			"之前让你记住的口令是什么？只输出口令",
 		);
-		turn2Reply = turn2Res.reply.trim();
+		turn2Reply = turn2Res.reply;
 		log(`Turn 2 prompt completed. Model reply: ${turn2Reply}`);
 
 		// Verify backend session ID on disk after Turn 2

@@ -45,6 +45,11 @@ function sdkAgent(agentId: string, messages: unknown[] = []) {
 	};
 }
 
+// The standalone branch uses the original option name; SDK-only aggregation uses sdkSessionId.
+function sdkSession(id: string) {
+	return { backendSessionId: id, sdkSessionId: id };
+}
+
 describe("CursorSdkRunner", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
@@ -121,12 +126,12 @@ describe("CursorSdkRunner", () => {
 
 		await runner.startPrompt({
 			workspace: "/tmp/project",
-			backendSessionId: pending,
+			...sdkSession(pending),
 			prompt: "<system_instructions>BB</system_instructions>\n\nfirst request",
 		}).completed;
 		await runner.startPrompt({
 			workspace: "/tmp/project",
-			backendSessionId: "agent-context",
+			...sdkSession("agent-context"),
 			prompt: "second request",
 		}).completed;
 
@@ -147,7 +152,7 @@ describe("CursorSdkRunner", () => {
 
 		await runner.startPrompt({
 			workspace: "/tmp/project",
-			backendSessionId: "agent-resumed",
+			...sdkSession("agent-resumed"),
 			prompt: "follow-up",
 		}).completed;
 

@@ -52,7 +52,7 @@ scripts/fork-aggregate            # 生成 .worktrees/aggregate-next 上的 aggr
 scripts/fork-aggregate --promote  # 提升已验证的 aggregate/next，并推送到 fork
 ```
 
-不带 `--promote` 时，脚本从基线 tag 开始，依次 `merge --no-ff` 清单中的分支，重新生成 `aggregate/next`。在 `.worktrees/aggregate-next` 里按下面的命令验证后，`--promote` 提升这个已验证的提交；提升前会检查工作区干净，并确认它包含当前基线与清单中每个分支的最新提交。分支推进后重新生成并验证。
+不带 `--promote` 时，脚本从基线 tag 开始，依次 `merge --no-ff` 清单中的分支，重新生成 `aggregate/next`。在 `.worktrees/aggregate-next` 里按下面的命令验证后，`--promote` 在独立临时 worktree 从当前基线和分支清单重建并比对完整文件树；相同才提升已验证的提交。重建失败或文件树不同会保留 `aggregate/next`，方便检查。分支推进后重新生成并验证。
 提升与推送到 fork 不需要再询问；替换本机运行中的服务按本项目的部署授权与流程执行。
 
 ### 验证命令

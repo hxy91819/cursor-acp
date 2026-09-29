@@ -33,8 +33,8 @@ export interface RunHarnessResult {
 	firstPid: number;
 	firstExitSignal: string | null;
 	secondPid: number;
-	firstBackendSessionId?: string;
-	secondBackendSessionId?: string;
+	firstSdkSessionId?: string;
+	secondSdkSessionId?: string;
 	replayedHistory: string;
 	turn1Reply: string;
 	turn2Reply: string;
@@ -323,8 +323,8 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 	let firstPid = 0;
 	let secondPid = 0;
 	let firstExitSignal: string | null = null;
-	let firstBackendSessionId: string | undefined;
-	let secondBackendSessionId: string | undefined;
+	let firstSdkSessionId: string | undefined;
+	let secondSdkSessionId: string | undefined;
 	let turn1Reply = "";
 	let turn2Reply = "";
 	let replayedHistory = "";
@@ -389,12 +389,12 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 		// Verify backend session ID on disk
 		const metaPath = getSessionFilePath(tempConfigDir, tempWorkspace, acpSessionId);
 		const metaBefore = await readSessionMeta(metaPath);
-		firstBackendSessionId = metaBefore.sdkSessionId;
-		log(`Turn 1 persisted sdkSessionId: ${firstBackendSessionId}`);
+		firstSdkSessionId = metaBefore.sdkSessionId;
+		log(`Turn 1 persisted sdkSessionId: ${firstSdkSessionId}`);
 
-		if (!firstBackendSessionId || !firstBackendSessionId.startsWith("agent-")) {
+		if (!firstSdkSessionId || !firstSdkSessionId.startsWith("agent-")) {
 			throw new Error(
-				`Turn 1 failed to establish real SDK agent session. sdkSessionId=${firstBackendSessionId}. Auth/Network failure is not a valid RED!`,
+				`Turn 1 failed to establish real SDK agent session. sdkSessionId=${firstSdkSessionId}. Auth/Network failure is not a valid RED!`,
 			);
 		}
 		if (turn1Reply !== "ACK") {
@@ -454,8 +454,8 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 
 		// Verify backend session ID on disk after Turn 2
 		const metaAfter = await readSessionMeta(metaPath);
-		secondBackendSessionId = metaAfter.sdkSessionId;
-		log(`Turn 2 persisted sdkSessionId: ${secondBackendSessionId}`);
+		secondSdkSessionId = metaAfter.sdkSessionId;
+		log(`Turn 2 persisted sdkSessionId: ${secondSdkSessionId}`);
 	} catch (err: unknown) {
 		const errorMessage = err instanceof Error ? err.message : String(err);
 		failureError = errorMessage;
@@ -476,7 +476,7 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 	const tokenRetained = turn2Reply === token;
 	const replayLeakedIntoTurn2 = turn2Reply.includes("ACK");
 	const sdkSessionIdRetained =
-		Boolean(firstBackendSessionId) && firstBackendSessionId === secondBackendSessionId;
+		Boolean(firstSdkSessionId) && firstSdkSessionId === secondSdkSessionId;
 	const passed =
 		!failureError &&
 		turn1Reply === "ACK" &&
@@ -487,7 +487,7 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 
 	log(`Summary for ${options.recoveryMethod}:`);
 	log(
-		`  sdkSessionIdRetained: ${sdkSessionIdRetained} (${firstBackendSessionId} -> ${secondBackendSessionId})`,
+		`  sdkSessionIdRetained: ${sdkSessionIdRetained} (${firstSdkSessionId} -> ${secondSdkSessionId})`,
 	);
 	log(`  tokenRetained: ${tokenRetained} (reply: "${turn2Reply}")`);
 	log(`  replayLeakedIntoTurn2: ${replayLeakedIntoTurn2}`);
@@ -509,8 +509,8 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 		firstPid,
 		firstExitSignal,
 		secondPid,
-		firstBackendSessionId,
-		secondBackendSessionId,
+		firstSdkSessionId,
+		secondSdkSessionId,
 		replayedHistory,
 		turn1Reply,
 		turn2Reply,

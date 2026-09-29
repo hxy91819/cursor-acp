@@ -1,0 +1,19 @@
+# Fork 分支清单：scripts/fork-aggregate 从 base 开始，按顺序 merge 下列分支生成 local/aggregate。
+# 格式：<分支>  <上游状态>  [上游链接]  # 一句话说明
+# 上游状态：needs-feedback（未反馈）| reported（已提 issue）| pr-open（已提 PR）| fork-only（个人偏好，不回流）| internal（fork 维护/部署）
+# 叠放分支（基于另一 fork 分支）必须排在其基础分支之后，说明里写 "叠在 <分支> 上"。
+# base 是 fork 本地 tag（upstream-main/<日期>-<短SHA>），另一台机器先 git fetch fork --tags。
+
+base upstream-main/20260924-d422bdd
+
+fork-tooling          internal                                          # fork 维护规则与聚合脚本
+feature/cursor-sdk-1-0-32 pr-open    https://github.com/raphaelluethy/cursor-acp/pull/3 # 升级 Cursor SDK 至 1.0.32 并适配署名补丁
+feature/mid-turn-steering pr-open https://github.com/raphaelluethy/cursor-acp/pull/4 # 叠在 feature/cursor-sdk-1-0-32 上；支持 Cursor SDK 文本 steer
+fix/cancel-config-sync needs-feedback # 叠在 feature/mid-turn-steering 上；修复取消后配置同步时序及同值 fast 设置
+feature/skill-discovery needs-feedback # 技能发现与调用、全局规则和自动技能清单
+feature/model-parameters needs-feedback # SDK 模型参数透传与按线程选择 1M 上下文
+fix/model-discovery-errors needs-feedback # 模型发现失败或空目录明确报错，避免缓存 Auto 兜底目录
+fix/vite-ghsa-p9ff-h696-f583 needs-feedback # Vitest 传递依赖 Vite 固定到已修复的 7.x（CVE-2026-39363）
+fix/bb-permission-mode needs-feedback # 按 BB 权限模式配置 Cursor SDK 的 full 与 accept-edits 行为
+fix/sdk-session-resume needs-feedback # 保持 ACP 恢复时的 Cursor SDK agent ID，覆盖 load 与 resume
+feature/sdk-only-backend needs-feedback # 叠在 fix/sdk-session-resume 上；移除旧 Cursor agent/Native/CLI 后端，仅保留 SDK

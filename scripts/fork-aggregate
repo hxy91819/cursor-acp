@@ -7,7 +7,7 @@ usage() {
 
 从 .fork/branches 的 base（或 --base）重新生成聚合：依次 merge 清单中的分支到
 .worktrees/aggregate-next 的 aggregate/next 分支。已解决过的冲突由 git rerere 自动复用。
---promote  成功后把根目录 local/aggregate 移到新结果，并推送到 fork（带 lease）。
+--promote  提升已验证且包含当前清单全部分支的 aggregate/next，并推送到 fork（带 lease）。
 清单读取自 fork-tooling 分支（本地优先，其次 fork/fork-tooling）。
 USAGE
 }
@@ -57,44 +57,63 @@ git config rerere.enabled true
 git config rerere.autoUpdate true
 
 wt="$root/.worktrees/aggregate-next"
-if [ -d "$wt" ]; then
-  git -C "$wt" merge --abort 2>/dev/null || true
-  if [ -n "$(git -C "$wt" status --porcelain)" ]; then
-    echo "$wt 有未提交改动，先处理后再运行" >&2
-    exit 1
-  fi
-  git -C "$wt" checkout --quiet -B aggregate/next "refs/tags/$base"
+if [ "$promote" = 1 ]; then
+  [ -d "$wt" ] || { echo "先运行 scripts/fork-aggregate 生成候选" >&2; exit 1; }
+  [ "$(git -C "$wt" branch --show-current)" = aggregate/next ] || {
+    echo "$wt 不在 aggregate/next" >&2; exit 1;
+  }
+  [ -z "$(git -C "$wt" status --porcelain)" ] || {
+    echo "$wt 有未提交改动，先处理后再提升" >&2; exit 1;
+  }
+  git -C "$wt" merge-base --is-ancestor "refs/tags/$base" HEAD || {
+    echo "候选未包含基线 $base" >&2; exit 1;
+  }
+  for branch in "${branches[@]}"; do
+    ref="$(resolve_ref "$branch")"
+    git -C "$wt" merge-base --is-ancestor "$ref" HEAD || {
+      echo "候选未包含当前 $branch ($ref)，先重新生成并验证" >&2; exit 1;
+    }
+  done
 else
-  git worktree add --quiet -B aggregate/next "$wt" "refs/tags/$base"
-fi
+  if [ -d "$wt" ]; then
+    git -C "$wt" merge --abort 2>/dev/null || true
+    if [ -n "$(git -C "$wt" status --porcelain)" ]; then
+      echo "$wt 有未提交改动，先处理后再运行" >&2
+      exit 1
+    fi
+    git -C "$wt" checkout --quiet -B aggregate/next "refs/tags/$base"
+  else
+    git worktree add --quiet -B aggregate/next "$wt" "refs/tags/$base"
+  fi
 
-for branch in "${branches[@]}"; do
-  ref="$(resolve_ref "$branch")"
-  if git -C "$wt" merge --quiet --no-autostash --no-ff --no-edit -m "Merge $branch" "$ref" >/dev/null 2>&1; then
-    echo "merged   $branch"
-    continue
-  fi
-  if [ -z "$(git -C "$wt" diff --name-only --diff-filter=U)" ]; then
-    git -C "$wt" commit --quiet --no-edit
-    echo "rerere   $branch"
-    continue
-  fi
-  echo "CONFLICT $branch"
-  git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/  /'
-  if ! git merge-tree --write-tree "refs/tags/$base" "$ref" >/dev/null 2>&1; then
-    cat <<EOF
+  for branch in "${branches[@]}"; do
+    ref="$(resolve_ref "$branch")"
+    if git -C "$wt" merge --quiet --no-autostash --no-ff --no-edit -m "Merge $branch" "$ref" >/dev/null 2>&1; then
+      echo "merged   $branch"
+      continue
+    fi
+    if [ -z "$(git -C "$wt" diff --name-only --diff-filter=U)" ]; then
+      git -C "$wt" commit --quiet --no-edit
+      echo "rerere   $branch"
+      continue
+    fi
+    echo "CONFLICT $branch"
+    git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/  /'
+    if ! git merge-tree --write-tree "refs/tags/$base" "$ref" >/dev/null 2>&1; then
+      cat <<EOF
 该分支单独合入 $base 就冲突：在它自己的 worktree 里 rebase 到 $base 并修复、验证，
 push --force-with-lease 到 fork 后重新运行本脚本。不要在聚合里修。
 EOF
-  else
-    cat <<EOF
+    else
+      cat <<EOF
 这是 fork 分支之间的冲突：在 $wt 里只做两边合并（不加新行为），
 git add 后 git commit --no-edit，然后重新运行本脚本（rerere 会记住这次解决）。
 同一对分支反复出现非平凡冲突时，把后者叠到前者上。
 EOF
-  fi
-  exit 1
-done
+    fi
+    exit 1
+  done
+fi
 
 result="$(git -C "$wt" rev-parse HEAD)"
 echo "聚合完成：aggregate/next = $result（base $base，${#branches[@]} 个分支）"

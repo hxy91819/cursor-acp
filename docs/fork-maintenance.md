@@ -49,11 +49,10 @@ git worktree add .worktrees/<name> -b feature/<name> "$base"   # 修复用 fix/<
 
 ```bash
 scripts/fork-aggregate            # 生成 .worktrees/aggregate-next 上的 aggregate/next
-scripts/fork-aggregate --promote  # 成功后移动根目录 local/aggregate 并推送到 fork
+scripts/fork-aggregate --promote  # 提升已验证的 aggregate/next，并推送到 fork
 ```
 
-脚本从基线 tag 开始，依次 `merge --no-ff` 清单中的分支。每次都从头生成，没有中间状态需要维护。
-在 `.worktrees/aggregate-next` 里按下面的验证命令验证，通过后再 `--promote`；各分支自己的测试在分支上已经跑过。
+不带 `--promote` 时，脚本从基线 tag 开始，依次 `merge --no-ff` 清单中的分支，重新生成 `aggregate/next`。在 `.worktrees/aggregate-next` 里按下面的命令验证后，`--promote` 提升这个已验证的提交；提升前会检查工作区干净，并确认它包含当前基线与清单中每个分支的最新提交。分支推进后重新生成并验证。
 提升与推送到 fork 不需要再询问；替换本机运行中的服务按本项目的部署授权与流程执行。
 
 ### 验证命令

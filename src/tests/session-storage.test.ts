@@ -156,19 +156,19 @@ describe("session-storage", () => {
 			const sessionId = "test-session";
 
 			await recordSessionMeta(cwd, sessionId, {
-				backendSessionId: "backend-1",
+				sdkSessionId: "backend-1",
 				modeId: "default",
 				modelId: "gpt-5.4-medium",
 			});
 			await recordSessionMeta(cwd, sessionId, {
-				backendSessionId: "backend-2",
+				sdkSessionId: "backend-2",
 				modeId: "yolo",
 				modelId: "gpt-5.2",
 			});
 
 			const meta = await readSessionMeta(sessionFilePath(cwd, sessionId));
 			expect(meta).toEqual({
-				backendSessionId: "backend-2",
+				sdkSessionId: "backend-2",
 				modeId: "yolo",
 				modelId: "gpt-5.2",
 			});
@@ -262,7 +262,7 @@ describe("session-storage", () => {
 					timestamp: new Date().toISOString(),
 					sessionId,
 					cwd,
-					backendSessionId: "backend-1",
+					sdkSessionId: "backend-1",
 				})}\n`,
 			);
 

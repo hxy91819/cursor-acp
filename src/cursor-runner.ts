@@ -16,7 +16,7 @@ export interface RunPromptOptions {
 	workspace: string;
 	prompt: string;
 	images?: CursorPromptImage[];
-	backendSessionId?: string;
+	sdkSessionId?: string;
 	modelId?: string;
 	modeId?: "plan" | "ask";
 	reviewPolicy?: "auto-review" | "run-everything";

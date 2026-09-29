@@ -14,7 +14,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 
 ## Features
 
-### Cursor SDK backend
+### Cursor SDK prompt execution
 
 - **Smart Auto Review by default**: New sessions create local SDK agents with `local.autoReview: true`. Cursor's classifier runs approved calls and fails closed on the rest.
 - **ACP permission fallback**: A call stopped by Auto Review is surfaced to the client. “Allow once” retries that turn with Auto Review disabled; “Always allow” switches the session to Yolo.
@@ -27,7 +27,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 ### Wrapper compatibility
 
 - **ACP session lifecycle**: Supports `new`, `resume`, and `fork` (best-effort) session operations
-- **Session persistence & history replay**: Stores visible history locally and replays it on resume/load
+- **Session persistence & history replay**: Keeps the ACP session ID separate from the SDK agent ID, and replays visible history on resume/load
 - **Session listing**: Lists past local sessions with optional cwd filtering and pagination
 - **Model listing and selection**: `/model` and ACP config options use the SDK catalog.
 - **ACP 1.4 controls**: Clients that advertise boolean config support receive Fast and on/off Thinking parameters as native toggles; older clients receive a select fallback. Multi-level thinking/reasoning/effort parameters remain selectors. After `session/set_config_option`, the adapter sends `config_option_update` so dependent Fast and Thinking controls appear immediately.
@@ -261,7 +261,7 @@ Oxlint and Oxfmt use their repository-level configurations. Source indentation u
 
 ## Migration Notes
 
-- See **Breaking changes (SDK backend and Auto Review default)** when upgrading from the CLI-backed adapter.
+- Prompt execution uses only the Cursor SDK. ACP clients can still use the older model picker and stable session method aliases.
 - Commit and PR attribution is read only from the global Cursor CLI config; project `.cursor/cli.json` attribution is ignored.
 - `auto-review`, `yolo`, `ask`, and `plan` are the advertised modes
 - `default`, `acceptEdits`, `agent`, and `autoReview` are accepted as compatibility aliases for **`auto-review`**. For Yolo, use **`yolo`**—`bypassPermissions` and `autoRunAllCommands` are no longer accepted (see **Legacy Yolo mode name aliases removed**)
@@ -283,7 +283,7 @@ src/
 ├── prompt-conversion.ts  # ACP text, context, and image conversion
 ├── auth.ts               # Cursor SDK authentication
 ├── settings.ts           # Mode ids and normalization helpers
-├── session-storage.ts    # Session persistence and history replay
+├── session-storage.ts    # ACP session persistence, SDK session ID, and history replay
 ├── slash-commands.ts     # Slash command handlers
 ├── tools.ts              # Tool definitions
 ├── utils.ts              # Utility functions

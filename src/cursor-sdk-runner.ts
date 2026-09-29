@@ -447,21 +447,21 @@ export class CursorSdkRunner implements CursorRunner {
 	}
 
 	private async resolveAgent(options: RunPromptOptions): Promise<SDKAgent> {
-		const backendSessionId = options.backendSessionId;
+		const sdkSessionId = options.sdkSessionId;
 		const configKey = this.agentConfig(options).key;
-		if (backendSessionId) {
-			const cached = this.agents.get(backendSessionId);
+		if (sdkSessionId) {
+			const cached = this.agents.get(sdkSessionId);
 			if (cached && cached.cwd === options.workspace && cached.configKey === configKey) {
 				return cached.agent;
 			}
 			if (cached) {
 				cached.agent.close();
-				this.agents.delete(backendSessionId);
+				this.agents.delete(sdkSessionId);
 			}
 
-			if (isResumableAgentId(backendSessionId)) {
-				const agent = await Agent.resume(backendSessionId, this.agentOptions(options));
-				this.agents.set(backendSessionId, {
+			if (isResumableAgentId(sdkSessionId)) {
+				const agent = await Agent.resume(sdkSessionId, this.agentOptions(options));
+				this.agents.set(sdkSessionId, {
 					agent,
 					cwd: options.workspace,
 					configKey,
@@ -471,8 +471,8 @@ export class CursorSdkRunner implements CursorRunner {
 		}
 
 		const agent = await Agent.create(this.agentOptions(options));
-		if (backendSessionId) {
-			this.agents.delete(backendSessionId);
+		if (sdkSessionId) {
+			this.agents.delete(sdkSessionId);
 		}
 		this.agents.set(agent.agentId, { agent, cwd: options.workspace, configKey });
 		return agent;

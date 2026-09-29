@@ -15,7 +15,7 @@ export interface AcpChildClient {
 	pid: number;
 	sendRequest<T = unknown>(method: string, params: Record<string, unknown>): Promise<T>;
 	sendPrompt(sessionId: string, promptText: string): Promise<{ reply: string; result: unknown }>;
-	waitForReplayedHistory(timeoutMs?: number): Promise<string[]>;
+	waitForReplayedHistory(expectedReply: string, timeoutMs?: number): Promise<string[]>;
 	getToolCallsAttempted(): number;
 	getStderr(): string;
 	kill(signal?: NodeJS.Signals): Promise<{ exitCode: number | null; signal: string | null }>;
@@ -42,7 +42,7 @@ export interface RunHarnessResult {
 	replayLeakedIntoTurn2: boolean;
 	error?: string;
 	tokenRetained: boolean;
-	backendSessionIdRetained: boolean;
+	sdkSessionIdRetained: boolean;
 	passed: boolean;
 }
 
@@ -70,7 +70,7 @@ export function spawnAcpChild(cwd: string, configDir: string): AcpChildClient {
 	let toolCallsAttempted = 0;
 	let stderrBuffer = "";
 	const replayedChunks: string[] = [];
-	let replayListener: ((chunk: string) => void) | null = null;
+	let replayListener: (() => void) | null = null;
 	let activePrompt: { chunks: string[] } | null = null;
 
 	// Consume stderr to avoid blocking the child process on full buffer
@@ -168,8 +168,11 @@ export function spawnAcpChild(cwd: string, configDir: string): AcpChildClient {
 						activePrompt.chunks.push(text);
 					} else {
 						replayedChunks.push(text);
-						replayListener?.(text);
+						replayListener?.();
 					}
+				}
+				if (update.sessionUpdate === "tool_call") {
+					toolCallsAttempted++;
 				}
 			}
 		} catch {
@@ -230,30 +233,32 @@ export function spawnAcpChild(cwd: string, configDir: string): AcpChildClient {
 	}
 
 	function waitForReplayedHistory(
+		expectedReply: string,
 		timeoutMs: number = 3000,
-		idleMs: number = 150,
 	): Promise<string[]> {
-		return new Promise<string[]>((resolve) => {
-			let idleTimer: NodeJS.Timeout | null = null;
-			let maxTimer: NodeJS.Timeout | null = null;
-
-			const finish = () => {
-				if (idleTimer) clearTimeout(idleTimer);
-				if (maxTimer) clearTimeout(maxTimer);
+		return new Promise<string[]>((resolve, reject) => {
+			const timer = setTimeout(() => {
 				replayListener = null;
-				resolve([...replayedChunks]);
+				reject(
+					new Error(
+						`History replay did not reach the complete first reply: ${replayedChunks.join("")}`,
+					),
+				);
+			}, timeoutMs);
+			const checkComplete = () => {
+				const received = replayedChunks.join("");
+				if (received === expectedReply) {
+					clearTimeout(timer);
+					replayListener = null;
+					resolve([...replayedChunks]);
+				} else if (!expectedReply.startsWith(received)) {
+					clearTimeout(timer);
+					replayListener = null;
+					reject(new Error(`Unexpected history replay: ${received}`));
+				}
 			};
-
-			if (replayedChunks.length > 0) {
-				idleTimer = setTimeout(finish, idleMs);
-			}
-
-			replayListener = () => {
-				if (idleTimer) clearTimeout(idleTimer);
-				idleTimer = setTimeout(finish, idleMs);
-			};
-
-			maxTimer = setTimeout(finish, timeoutMs);
+			replayListener = checkComplete;
+			checkComplete();
 		});
 	}
 
@@ -384,13 +389,16 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 		// Verify backend session ID on disk
 		const metaPath = getSessionFilePath(tempConfigDir, tempWorkspace, acpSessionId);
 		const metaBefore = await readSessionMeta(metaPath);
-		firstBackendSessionId = metaBefore.backendSessionId;
-		log(`Turn 1 persisted backendSessionId: ${firstBackendSessionId}`);
+		firstBackendSessionId = metaBefore.sdkSessionId;
+		log(`Turn 1 persisted sdkSessionId: ${firstBackendSessionId}`);
 
 		if (!firstBackendSessionId || !firstBackendSessionId.startsWith("agent-")) {
 			throw new Error(
-				`Turn 1 failed to establish real SDK agent session. backendSessionId=${firstBackendSessionId}. Auth/Network failure is not a valid RED!`,
+				`Turn 1 failed to establish real SDK agent session. sdkSessionId=${firstBackendSessionId}. Auth/Network failure is not a valid RED!`,
 			);
+		}
+		if (turn1Reply !== "ACK") {
+			throw new Error(`Turn 1 reply was not exactly ACK: ${turn1Reply}`);
 		}
 
 		// Step 2: Kill child 1 with SIGKILL
@@ -427,7 +435,7 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 		log(`Recovery request succeeded`);
 
 		// Await and drain replayed history from recovery before sending Turn 2
-		const replayed = await client2.waitForReplayedHistory(2000);
+		const replayed = await client2.waitForReplayedHistory("ACK", 10000);
 		replayedHistory = replayed.join("");
 		if (replayedHistory) {
 			log(
@@ -446,8 +454,8 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 
 		// Verify backend session ID on disk after Turn 2
 		const metaAfter = await readSessionMeta(metaPath);
-		secondBackendSessionId = metaAfter.backendSessionId;
-		log(`Turn 2 persisted backendSessionId: ${secondBackendSessionId}`);
+		secondBackendSessionId = metaAfter.sdkSessionId;
+		log(`Turn 2 persisted sdkSessionId: ${secondBackendSessionId}`);
 	} catch (err: unknown) {
 		const errorMessage = err instanceof Error ? err.message : String(err);
 		failureError = errorMessage;
@@ -465,20 +473,21 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 
 	const toolCallsAttempted =
 		(client1?.getToolCallsAttempted() ?? 0) + (client2?.getToolCallsAttempted() ?? 0);
-	const tokenRetained = turn2Reply.includes(token);
+	const tokenRetained = turn2Reply === token;
 	const replayLeakedIntoTurn2 = turn2Reply.includes("ACK");
-	const backendSessionIdRetained =
+	const sdkSessionIdRetained =
 		Boolean(firstBackendSessionId) && firstBackendSessionId === secondBackendSessionId;
 	const passed =
 		!failureError &&
+		turn1Reply === "ACK" &&
 		tokenRetained &&
 		!replayLeakedIntoTurn2 &&
-		backendSessionIdRetained &&
+		sdkSessionIdRetained &&
 		toolCallsAttempted === 0;
 
 	log(`Summary for ${options.recoveryMethod}:`);
 	log(
-		`  backendSessionIdRetained: ${backendSessionIdRetained} (${firstBackendSessionId} -> ${secondBackendSessionId})`,
+		`  sdkSessionIdRetained: ${sdkSessionIdRetained} (${firstBackendSessionId} -> ${secondBackendSessionId})`,
 	);
 	log(`  tokenRetained: ${tokenRetained} (reply: "${turn2Reply}")`);
 	log(`  replayLeakedIntoTurn2: ${replayLeakedIntoTurn2}`);
@@ -509,7 +518,7 @@ export async function runSessionResumeE2E(options: RunHarnessOptions): Promise<R
 		replayLeakedIntoTurn2,
 		error: failureError,
 		tokenRetained,
-		backendSessionIdRetained,
+		sdkSessionIdRetained,
 		passed,
 	};
 }

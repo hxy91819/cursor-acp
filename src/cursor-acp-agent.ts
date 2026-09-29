@@ -1,7 +1,7 @@
 import {
 	Agent,
-	AuthenticateRequest,
 	AvailableCommand,
+	AuthenticateRequest,
 	CancelNotification,
 	ClientCapabilities,
 	ForkSessionRequest,
@@ -17,8 +17,6 @@ import {
 	ReadTextFileRequest,
 	ReadTextFileResponse,
 	RequestError,
-	RequestPermissionRequest,
-	RequestPermissionResponse,
 	ResumeSessionRequest,
 	ResumeSessionResponse,
 	SetSessionModeRequest,
@@ -27,7 +25,6 @@ import {
 	SetSessionConfigOptionResponse,
 	SessionConfigOption,
 	SessionNotification,
-	ToolCallContent,
 	WriteTextFileRequest,
 	WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
@@ -41,13 +38,6 @@ import {
 import { CursorAuth, CursorAuthClient } from "./auth.js";
 import type { CursorAcpClient } from "./cursor-acp-client.js";
 import { CachedToolUse, mapCursorEventToAcp, RejectedToolCall } from "./cursor-event-mapper.js";
-import {
-	CreateNativeSessionOptions,
-	CursorNativeAcpClient,
-	NativeModeId,
-	NativeSessionBackend,
-	NativeSessionCallbacks,
-} from "./cursor-native-acp-client.js";
 import type { CursorRunner, RunPromptOptions } from "./cursor-runner.js";
 import { CursorSdkRunner } from "./cursor-sdk-runner.js";
 import type {
@@ -88,19 +78,16 @@ import {
 	handleSlashCommand,
 	loadCustomSlashCommands,
 	mergeAvailableSlashCommands,
-	normalizeSlashCommandName,
 	resolveCustomSlashCommandPrompt,
 	resolveSkillSlashCommandPrompt,
 } from "./slash-commands.js";
 import { CustomSkill, loadCustomSkills } from "./skills.js";
 import {
-	AgentSessionModeId,
 	availableModes,
 	DEFAULT_MODE_ID,
 	getEnvDefaultMode,
 	getEnvDefaultModel,
 	getEnvDefaultThinking,
-	isAgentSessionMode,
 	normalizeModeId,
 	SessionModeId,
 } from "./settings.js";
@@ -114,154 +101,9 @@ import {
 	recordUserMessage,
 	replaySessionHistory,
 } from "./session-storage.js";
-import {
-	appendAssistantTextFromNativeChunk,
-	formatTurnRecapMarkdown,
-	recordTurnArtifactsFromNativeSessionUpdate,
-	type TurnArtifact,
-} from "./native-assistant-stream.js";
-import { isObject, Logger, unreachable } from "./utils.js";
+import { Logger, unreachable } from "./utils.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-
-function markdownEscape(text: string): string {
-	let fence = "```";
-	for (const [m] of text.matchAll(/^```+/gm)) {
-		while (m.length >= fence.length) {
-			fence += "`";
-		}
-	}
-	return `${fence}\n${text}${text.endsWith("\n") ? "" : "\n"}${fence}`;
-}
-
-function plainTextContent(text: string): ToolCallContent[] {
-	return [
-		{
-			type: "content",
-			content: {
-				type: "text",
-				text,
-			},
-		},
-	];
-}
-
-type ToolSessionUpdate = Extract<
-	SessionNotification["update"],
-	{ sessionUpdate: "tool_call" } | { sessionUpdate: "tool_call_update" }
->;
-
-type ExecuteToolUpdate = ToolSessionUpdate & {
-	rawInput?: { command?: string; description?: string };
-	rawOutput?: string;
-	_meta?: {
-		terminal_info?: { cwd?: string };
-		terminal_output?: unknown;
-		terminal_exit?: unknown;
-		[key: string]: unknown;
-	};
-};
-
-function summarizeExecuteToolCall(update: ExecuteToolUpdate): ToolCallContent[] | undefined {
-	const rawInput = update.rawInput;
-	if (!rawInput || typeof rawInput !== "object") {
-		return undefined;
-	}
-	const command = typeof rawInput.command === "string" ? rawInput.command : "";
-	if (!command) {
-		return undefined;
-	}
-	const description = typeof rawInput.description === "string" ? rawInput.description : "";
-	const cwd = update._meta?.terminal_info?.cwd;
-	const lines: string[] = [];
-	if (description) {
-		lines.push(description, "");
-	}
-	lines.push("```sh", command, "```");
-	if (typeof cwd === "string" && cwd.length > 0) {
-		lines.push("", `Current directory:`, cwd);
-	}
-	return plainTextContent(lines.join("\n"));
-}
-
-function summarizeExecuteToolResult(update: ExecuteToolUpdate): ToolCallContent[] | undefined {
-	const rawOutput = update.rawOutput;
-	if (typeof rawOutput === "string") {
-		return plainTextContent(markdownEscape(rawOutput || "Command completed with no output."));
-	}
-	return undefined;
-}
-
-function normalizeNativeToolUpdateForClient(
-	update: SessionNotification["update"],
-	clientCapabilities?: ClientCapabilities,
-): SessionNotification["update"] {
-	const supportsTerminalOutput = clientCapabilities?._meta?.["terminal_output"] === true;
-	if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
-		return update;
-	}
-	const toolUpdate = update as ExecuteToolUpdate;
-	const rawInput = toolUpdate.rawInput;
-	const command =
-		rawInput && typeof rawInput === "object" && typeof rawInput.command === "string"
-			? rawInput.command
-			: "";
-	const hasTerminalMeta = Boolean(
-		toolUpdate._meta?.terminal_info ||
-		toolUpdate._meta?.terminal_output ||
-		toolUpdate._meta?.terminal_exit,
-	);
-	const looksLikeShellTool =
-		command.length > 0 ||
-		hasTerminalMeta ||
-		(update.kind === "execute" && !supportsTerminalOutput);
-	if (!looksLikeShellTool) {
-		return update;
-	}
-
-	const next: ExecuteToolUpdate = { ...toolUpdate };
-	if (update.sessionUpdate === "tool_call") {
-		const content = summarizeExecuteToolCall(next);
-		if (content) {
-			next.content = content;
-		}
-		const command = typeof next.rawInput?.command === "string" ? next.rawInput.command : "";
-		if (command) {
-			next.title = command;
-		}
-	} else {
-		const hasOnlyTerminalContent =
-			Array.isArray(next.content) &&
-			next.content.length > 0 &&
-			next.content.every((item) => item.type === "terminal");
-		if (hasOnlyTerminalContent || !Array.isArray(next.content) || next.content.length === 0) {
-			const content = summarizeExecuteToolResult(next);
-			if (content) {
-				next.content = content;
-			}
-		}
-	}
-
-	if (next._meta && typeof next._meta === "object") {
-		const meta = { ...next._meta };
-		delete meta.terminal_info;
-		delete meta.terminal_output;
-		delete meta.terminal_exit;
-		next._meta = meta;
-	}
-
-	return next as SessionNotification["update"];
-}
-
-function normalizePermissionToolCallTitle(
-	toolCall: RequestPermissionRequest["toolCall"],
-): RequestPermissionRequest["toolCall"] {
-	const rawInput = toolCall.rawInput;
-	const command =
-		isObject(rawInput) && typeof rawInput.command === "string" ? rawInput.command : "";
-
-	return command ? { ...toolCall, title: command } : toolCall;
-}
 
 function appendDebugLog(label: string, value: unknown): void {
 	if (process.env.CURSOR_ACP_DEBUG_LOG !== "1") {
@@ -450,11 +292,6 @@ function fastCandidatesFrom(raw: LooseSessionDefaults): unknown[] {
 	];
 }
 
-interface ActivePromptState {
-	assistantTextChunks: string[];
-	turnArtifacts: TurnArtifact[];
-}
-
 interface ActiveRunState {
 	cancel: () => void;
 }
@@ -475,26 +312,14 @@ export interface SessionState {
 	configuredThinkingLevel?: string;
 	fastValue?: string;
 	configuredFastValue?: string;
-	lastAgentModeId: AgentSessionModeId;
 	cancelled: boolean;
-	activePrompt?: ActivePromptState;
 	activeRun?: ActiveRunState;
-	backendSessionId?: string;
-	/** Populated from native `session/new` or `session/load` when available. */
-	nativeSessionModels?: LegacySessionModels;
+	sdkSessionId?: string;
 	/** Populated from the active runner's model catalog. */
-	fallbackSessionModels?: LegacySessionModels;
-	/** Set when `createBackend` attempted native `session/load`: `true` if load worked, `false` if we fell back to `session/new`. */
-	nativeLoadSucceeded?: boolean;
-	nativeAvailableCommands: AvailableCommand[];
+	sessionModels?: LegacySessionModels;
 	customSlashCommands: CustomSlashCommand[];
 	customSkills: CustomSkill[];
-	nativeClient?: NativeSessionBackend;
-	nativeModelId?: string;
-	pendingNativeSessionId?: string;
-	nativeStartPromise?: Promise<void>;
 	configMutationPromise?: Promise<void>;
-	appliedNativeModeId?: NativeModeId;
 	notificationsReady: boolean;
 	pendingNotifications: SessionNotification[];
 	modelCatalog?: CursorModelDescriptor[];
@@ -504,11 +329,6 @@ export interface CursorAcpAgentOptions {
 	runner?: CursorRunner;
 	auth?: CursorAuthClient;
 	logger?: Logger;
-	createNativeClient?: (
-		options: CreateNativeSessionOptions,
-		callbacks: NativeSessionCallbacks,
-	) => NativeSessionBackend;
-	nativeCommand?: string;
 }
 
 export class CursorAcpAgent implements Agent {
@@ -522,11 +342,6 @@ export class CursorAcpAgent implements Agent {
 	private readonly runner: CursorRunner;
 	private readonly auth: CursorAuthClient;
 	private readonly logger: Logger;
-	private readonly createNativeClient: (
-		options: CreateNativeSessionOptions,
-		callbacks: NativeSessionCallbacks,
-	) => NativeSessionBackend;
-	private readonly nativeCommand?: string;
 
 	constructor(
 		private readonly client: CursorAcpClient,
@@ -535,10 +350,6 @@ export class CursorAcpAgent implements Agent {
 		this.logger = options.logger ?? console;
 		this.runner = options.runner ?? new CursorSdkRunner(undefined, this.logger);
 		this.auth = options.auth ?? new CursorAuth();
-		this.nativeCommand = options.nativeCommand;
-		this.createNativeClient =
-			options.createNativeClient ??
-			((nativeOptions, callbacks) => new CursorNativeAcpClient(nativeOptions, callbacks));
 	}
 
 	async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -630,19 +441,13 @@ export class CursorAcpAgent implements Agent {
 			preferredModelId: meta.modelId,
 			preferredThinkingLevel: meta.thinkingLevel,
 			preferredFastValue: meta.fastValue,
-			preferredBackendSessionId: meta.backendSessionId,
+			preferredSdkSessionId: meta.sdkSessionId,
 		});
 
 		const session = this.requireSession(params.sessionId);
 
 		return await this.withDeferredSessionNotifications(session, async () => {
-			const notificationStartIndex = session.pendingNotifications.length;
-			if (
-				filePath &&
-				!this.hasConversationHistoryNotifications(
-					session.pendingNotifications.slice(notificationStartIndex),
-				)
-			) {
+			if (filePath) {
 				await this.replayStoredSessionHistory(session, filePath);
 			}
 
@@ -731,28 +536,18 @@ export class CursorAcpAgent implements Agent {
 			preferredModelId: meta.modelId,
 			preferredThinkingLevel: meta.thinkingLevel,
 			preferredFastValue: meta.fastValue,
-			preferredBackendSessionId: meta.backendSessionId,
+			preferredSdkSessionId: meta.sdkSessionId,
 		});
 
 		const session = this.requireSession(params.sessionId);
 
 		return await this.withDeferredSessionNotifications(session, async () => {
-			const notificationStartIndex = session.pendingNotifications.length;
-			if (
-				!this.hasConversationHistoryNotifications(
-					session.pendingNotifications.slice(notificationStartIndex),
-				)
-			) {
-				await this.replayStoredSessionHistory(session, filePath);
-			}
+			await this.replayStoredSessionHistory(session, filePath);
 
 			return {
 				modes: availableModes(session.modeId),
-				models: session.nativeSessionModels ?? response.models,
-				configOptions: this.buildConfigOptions(
-					session,
-					session.nativeSessionModels ?? response.models,
-				),
+				models: response.models,
+				configOptions: this.buildConfigOptions(session, response.models),
 			};
 		});
 	}
@@ -775,7 +570,7 @@ export class CursorAcpAgent implements Agent {
 
 		const slash = parseLeadingSlashCommand(promptText);
 		if (slash.hasSlash) {
-			if (!this.hasNativeSlashCommand(session, slash.command)) {
+			{
 				const handled = await handleSlashCommand(slash.command, slash.args, {
 					session,
 					auth: this.auth,
@@ -788,7 +583,6 @@ export class CursorAcpAgent implements Agent {
 						session.modelId = modelId;
 						session.configuredModelId = modelId;
 						this.syncModelParameters(session);
-						await this.applyNativeModelIfConnected(session);
 						await this.persistSessionMeta(session);
 					},
 				});
@@ -836,7 +630,7 @@ export class CursorAcpAgent implements Agent {
 			throw RequestError.authRequired();
 		}
 
-		if (session.activePrompt || session.activeRun) {
+		if (session.activeRun) {
 			throw RequestError.invalidParams(
 				undefined,
 				"Cannot send a prompt while another prompt is in progress",
@@ -889,7 +683,6 @@ export class CursorAcpAgent implements Agent {
 		const session = this.requireSession(params.sessionId);
 		session.cancelled = true;
 		session.activeRun?.cancel();
-		await session.nativeClient?.cancel();
 	}
 
 	async unstable_setSessionModel(
@@ -897,14 +690,13 @@ export class CursorAcpAgent implements Agent {
 	): Promise<LegacySetSessionModelResponse | void> {
 		const session = this.requireSession(params.sessionId);
 		return await this.withSessionConfigMutation(session, async () => {
-			if (session.activePrompt || session.activeRun) {
+			if (session.activeRun) {
 				throw RequestError.invalidParams("Cannot change model during an active prompt");
 			}
 
 			session.modelId = normalizeModelId(params.modelId);
 			session.configuredModelId = session.modelId;
 			this.syncModelParameters(session);
-			await this.applyNativeModelIfConnected(session);
 			await this.persistSessionMeta(session);
 			return {};
 		});
@@ -953,19 +745,18 @@ export class CursorAcpAgent implements Agent {
 		}
 
 		if (configId === "model") {
-			if (session.activePrompt || session.activeRun) {
+			if (session.activeRun) {
 				throw RequestError.invalidParams("Cannot change model during an active prompt");
 			}
 			session.modelId = normalizeModelId(value);
 			session.configuredModelId = session.modelId;
 			this.syncModelParameters(session);
-			await this.applyNativeModelIfConnected(session);
 			await this.persistSessionMeta(session);
 			return { configOptions: this.buildConfigOptions(session) };
 		}
 
 		if (configId === FAST_PARAM_ID) {
-			if (session.activePrompt || session.activeRun) {
+			if (session.activeRun) {
 				throw RequestError.invalidParams("Cannot change fast mode during an active prompt");
 			}
 			const fastParameter = getFastParameterForModel(session.modelCatalog, session.modelId);
@@ -986,13 +777,12 @@ export class CursorAcpAgent implements Agent {
 			session.fastValue = value;
 			session.configuredFastValue = value;
 			this.syncModelParameters(session);
-			await this.applyNativeModelIfConnected(session);
 			await this.persistSessionMeta(session);
 			return { configOptions: this.buildConfigOptions(session) };
 		}
 
 		if (configId === THINKING_PARAM_ID) {
-			if (session.activePrompt || session.activeRun) {
+			if (session.activeRun) {
 				throw RequestError.invalidParams(
 					"Cannot change thinking level during an active prompt",
 				);
@@ -1018,7 +808,6 @@ export class CursorAcpAgent implements Agent {
 			session.thinkingLevel = value;
 			session.configuredThinkingLevel = value;
 			this.syncModelParameters(session);
-			await this.applyNativeModelIfConnected(session);
 			await this.persistSessionMeta(session);
 			return { configOptions: this.buildConfigOptions(session) };
 		}
@@ -1044,32 +833,6 @@ export class CursorAcpAgent implements Agent {
 			if (session.configMutationPromise === drain) {
 				session.configMutationPromise = undefined;
 			}
-		}
-	}
-
-	private async applyNativeModelIfConnected(session: SessionState): Promise<void> {
-		if (!session.nativeClient?.alive || !session.backendSessionId || !session.modelId) {
-			return;
-		}
-		if (session.nativeModelId === session.modelId) {
-			return;
-		}
-
-		try {
-			await session.nativeClient.setNativeModel(session.modelId);
-			session.nativeModelId = session.modelId;
-			if (session.nativeSessionModels) {
-				session.nativeSessionModels.currentModelId = session.modelId;
-			}
-			if (session.fallbackSessionModels) {
-				session.fallbackSessionModels.currentModelId = session.modelId;
-			}
-		} catch (error) {
-			session.nativeModelId = undefined;
-			this.logger.warn?.(
-				"[cursor-acp] Native ACP did not accept model update; will apply on next prompt",
-				error,
-			);
 		}
 	}
 
@@ -1116,8 +879,7 @@ export class CursorAcpAgent implements Agent {
 		preferredModelId?: string;
 		preferredThinkingLevel?: string;
 		preferredFastValue?: string;
-		preferredBackendSessionId?: string;
-		warmNativeBackend?: boolean;
+		preferredSdkSessionId?: string;
 	}): Promise<ExtendedNewSessionResponse> {
 		const modeId = params.preferredModeId ?? this.defaultModeId ?? DEFAULT_MODE_ID;
 		const configuredModelId = params.preferredModelId ?? this.defaultModelId;
@@ -1132,22 +894,19 @@ export class CursorAcpAgent implements Agent {
 			configuredModelId,
 			configuredThinkingLevel,
 			configuredFastValue,
-			lastAgentModeId: isAgentSessionMode(modeId) ? modeId : "auto-review",
 			cancelled: false,
-			nativeAvailableCommands: [],
 			customSlashCommands: [],
 			customSkills: [],
 			notificationsReady: false,
 			pendingNotifications: [],
-			backendSessionId: params.preferredBackendSessionId,
-			pendingNativeSessionId: params.preferredBackendSessionId,
+			sdkSessionId: params.preferredSdkSessionId,
 		};
 
 		this.sessions[session.sessionId] = session;
 
 		await this.loadSessionSlashExtensions(session);
-		const fallbackModels = await this.getAvailableModels(session);
-		session.fallbackSessionModels = fallbackModels;
+		const sessionModels = await this.getAvailableModels(session);
+		session.sessionModels = sessionModels;
 		await this.emitOrQueueNotification(session, {
 			sessionId: session.sessionId,
 			update: {
@@ -1155,9 +914,6 @@ export class CursorAcpAgent implements Agent {
 				availableCommands: this.availableCommandsForSession(session),
 			},
 		});
-		if (params.warmNativeBackend) {
-			this.startNativeBackendWarmup(session);
-		}
 		session.notificationsReady = true;
 		setTimeout(() => {
 			void this.flushPendingNotifications(session);
@@ -1165,12 +921,9 @@ export class CursorAcpAgent implements Agent {
 
 		return {
 			sessionId: session.sessionId,
-			models: session.nativeSessionModels ?? fallbackModels,
+			models: sessionModels,
 			modes: availableModes(session.modeId),
-			configOptions: this.buildConfigOptions(
-				session,
-				session.nativeSessionModels ?? fallbackModels,
-			),
+			configOptions: this.buildConfigOptions(session, sessionModels),
 		};
 	}
 
@@ -1193,42 +946,6 @@ export class CursorAcpAgent implements Agent {
 			session.customSkills = customSkills.value;
 		} else {
 			this.logger.warn?.("[cursor-acp] Unable to load custom skills", customSkills.reason);
-		}
-	}
-
-	private startNativeBackendWarmup(session: SessionState): void {
-		if (session.nativeClient?.alive || session.nativeStartPromise) {
-			return;
-		}
-
-		session.nativeStartPromise = this.maybeWarmNativeBackendOnSessionCreate(session).finally(
-			() => {
-				session.nativeStartPromise = undefined;
-			},
-		);
-	}
-
-	private async maybeWarmNativeBackendOnSessionCreate(session: SessionState): Promise<void> {
-		try {
-			const status = await this.auth.status();
-			if (!status.loggedIn) {
-				return;
-			}
-		} catch (error) {
-			this.logger.warn?.(
-				"[cursor-acp] Unable to determine auth status during session creation",
-				error,
-			);
-			return;
-		}
-
-		try {
-			await this.createBackend(session);
-		} catch (error) {
-			this.logger.warn?.(
-				"[cursor-acp] Unable to warm native ACP backend during session creation",
-				error,
-			);
 		}
 	}
 
@@ -1276,253 +993,16 @@ export class CursorAcpAgent implements Agent {
 		};
 	}
 
-	private async createBackend(
-		session: SessionState,
-		options?: { loadNativeSessionId?: string },
-	): Promise<void> {
-		const requestedModelId = session.modelId;
-		const nativeClient = this.createNativeClient(
-			{
-				clientCapabilities: this.clientCapabilities,
-				command: this.nativeCommand,
-				cwd: session.cwd,
-				logger: this.logger,
-				mcpServers: session.mcpServers,
-				modelId: session.modelId,
-			},
-			{
-				onSessionUpdate: async (notification) => {
-					await this.handleNativeSessionUpdate(session, notification);
-				},
-				onRequestPermission: async (request) => {
-					return await this.handleNativePermissionRequest(session, request);
-				},
-				onExtMethod: async (method, params) => {
-					return await this.client.extMethod(
-						method,
-						this.rewriteNativeExtensionParams(session, params),
-					);
-				},
-				onExtNotification: async (method, params) => {
-					await this.client.extNotification(
-						method,
-						this.rewriteNativeExtensionParams(session, params),
-					);
-				},
-				onReadTextFile: async (request) => await this.client.readTextFile(request),
-				onWriteTextFile: async (request) => await this.client.writeTextFile(request),
-				onUnexpectedClose: (error) => {
-					if (session.nativeClient === nativeClient) {
-						session.nativeClient = undefined;
-						session.backendSessionId = undefined;
-						session.nativeModelId = undefined;
-					}
-					this.logger.error("[cursor-acp] native ACP backend closed", error);
-				},
-			},
-		);
-
-		session.nativeClient = nativeClient;
-
-		const loadId = options?.loadNativeSessionId ?? session.pendingNativeSessionId;
-
-		if (loadId) {
-			try {
-				const loaded = await nativeClient.loadSessionBackend(loadId);
-				if (!this.isCurrentNativeClient(session, nativeClient)) {
-					await nativeClient.close();
-					return;
-				}
-				session.backendSessionId = loadId;
-				session.pendingNativeSessionId = undefined;
-				session.nativeModelId = requestedModelId;
-				await this.applyNativeSessionModelsAndModes(session, loaded);
-				session.nativeLoadSucceeded = true;
-			} catch (error) {
-				if (!this.isCurrentNativeClient(session, nativeClient)) {
-					return;
-				}
-				this.logger.warn?.(
-					"[cursor-acp] Native session/load failed; starting a new native session",
-					error,
-				);
-				session.nativeLoadSucceeded = false;
-				const response = await nativeClient.createSessionBackend();
-				if (!this.isCurrentNativeClient(session, nativeClient)) {
-					await nativeClient.close();
-					return;
-				}
-				session.backendSessionId = response.sessionId;
-				session.pendingNativeSessionId = undefined;
-				session.nativeModelId = requestedModelId;
-				await this.applyNativeSessionModelsAndModes(session, response);
-			}
-		} else {
-			const response = await nativeClient.createSessionBackend();
-			if (!this.isCurrentNativeClient(session, nativeClient)) {
-				await nativeClient.close();
-				return;
-			}
-			session.backendSessionId = response.sessionId;
-			session.pendingNativeSessionId = undefined;
-			session.nativeModelId = requestedModelId;
-			await this.applyNativeSessionModelsAndModes(session, response);
-		}
-
-		try {
-			await this.persistSessionMeta(session);
-		} catch (error) {
-			this.logger.error("[cursor-acp] Failed to record session meta", error);
-		}
-
-		await this.applyNativeModeAfterConnect(session, nativeClient);
-	}
-
-	private isCurrentNativeClient(
-		session: SessionState,
-		nativeClient: NativeSessionBackend,
-	): boolean {
-		return session.nativeClient === nativeClient && nativeClient.alive;
-	}
-
-	private async applyNativeSessionModelsAndModes(
-		session: SessionState,
-		loaded: {
-			models?: LegacySessionModels;
-			modes?: NewSessionResponse["modes"];
-		},
-	): Promise<void> {
-		if (loaded.models) {
-			let listedModels: CursorModelDescriptor[] = [];
-			try {
-				listedModels = await this.runner.listModels();
-			} catch (error) {
-				this.logger.warn?.("[cursor-acp] Unable to refresh the full model list", error);
-			}
-
-			const modelCatalog = withCliModelParameters(
-				mergeModelCatalogs(
-					listedModels.length > 0
-						? listedModels
-						: loaded.models.availableModels.map((model) => ({
-								modelId: normalizeModelId(model.modelId),
-								name: model.name,
-								current: loaded.models?.currentModelId === model.modelId,
-							})),
-					session.modelCatalog,
-				),
-			);
-			session.modelCatalog = modelCatalog;
-
-			const availableModels =
-				modelCatalog.length > 0
-					? modelCatalog.map((model) => ({
-							modelId: model.modelId,
-							name: this.modelDisplayName(model.modelId, model.name),
-							description: this.modelHoverDescription(model.modelId, model.name),
-						}))
-					: [
-							...new Map(
-								(loaded.models.availableModels ?? []).map((model) => {
-									const normalizedModelId = normalizeModelId(model.modelId);
-									return [
-										normalizedModelId,
-										{
-											modelId: normalizedModelId,
-											name: this.modelDisplayName(
-												normalizedModelId,
-												model.name,
-											),
-											description: this.modelHoverDescription(
-												normalizedModelId,
-												model.description ?? model.name,
-											),
-										},
-									];
-								}),
-							).values(),
-						];
-
-			const resolvedConfiguredModelId = resolveModelId(
-				session.configuredModelId,
-				modelCatalog,
-			);
-			if (resolvedConfiguredModelId) {
-				session.configuredModelId = resolvedConfiguredModelId;
-			}
-			const resolvedSessionModelId = resolveModelId(session.modelId, modelCatalog);
-			const resolvedNativeCurrentModelId = resolveModelId(
-				loaded.models.currentModelId,
-				modelCatalog,
-			);
-
-			const currentModelId =
-				resolvedConfiguredModelId ??
-				resolvedNativeCurrentModelId ??
-				modelCatalog.find((model) => model.current)?.modelId ??
-				resolvedSessionModelId ??
-				availableModels[0]?.modelId;
-
-			session.nativeSessionModels = {
-				...loaded.models,
-				currentModelId,
-				availableModels,
-			};
-			if (currentModelId) {
-				session.modelId = currentModelId;
-			}
-			this.syncModelParameters(session);
-			if (session.nativeSessionModels && session.modelId) {
-				session.nativeSessionModels.currentModelId = session.modelId;
-			}
-		}
-
-		if (loaded.modes?.currentModeId) {
-			if (
-				loaded.modes.currentModeId !== "agent" ||
-				(session.modeId !== "ask" && session.modeId !== "plan")
-			) {
-				const translated = this.translateNativeMode(session, loaded.modes.currentModeId);
-				session.modeId = translated;
-				if (isAgentSessionMode(translated)) {
-					session.lastAgentModeId = translated;
-				}
-			}
-		}
-	}
-
-	private async applyNativeModeAfterConnect(
-		session: SessionState,
-		nativeClient: NativeSessionBackend,
-	): Promise<void> {
-		if (session.modeId === "ask" || session.modeId === "plan") {
-			const nativeMode = this.modeToNativeMode(session.modeId);
-			if (session.appliedNativeModeId === nativeMode) {
-				return;
-			}
-			await nativeClient.setNativeMode(nativeMode);
-			session.appliedNativeModeId = nativeMode;
-		}
-	}
-
 	private buildResumeResponse(
 		session: SessionState,
 		fallback: ExtendedNewSessionResponse,
 	): ExtendedResumeSessionResponse {
-		const models = session.nativeSessionModels ?? fallback.models;
+		const models = fallback.models;
 		return {
 			models,
 			modes: availableModes(session.modeId),
 			configOptions: this.buildConfigOptions(session, models),
 		};
-	}
-
-	private hasConversationHistoryNotifications(notifications: SessionNotification[]): boolean {
-		return notifications.some(
-			(notification) =>
-				notification.update.sessionUpdate === "user_message_chunk" ||
-				notification.update.sessionUpdate === "agent_message_chunk",
-		);
 	}
 
 	private async replayStoredSessionHistory(
@@ -1555,43 +1035,6 @@ export class CursorAcpAgent implements Agent {
 				void this.flushPendingNotifications(session);
 			}, 0);
 		}
-	}
-
-	private async ensureBackend(session: SessionState): Promise<void> {
-		if (session.nativeStartPromise) {
-			await session.nativeStartPromise;
-			if (session.nativeClient?.alive) {
-				if (!session.modelId || session.nativeModelId === session.modelId) {
-					return;
-				}
-				await this.applyNativeModelIfConnected(session);
-				return;
-			}
-		}
-
-		if (session.nativeClient?.alive) {
-			if (session.modelId && session.nativeModelId !== session.modelId) {
-				await this.applyNativeModelIfConnected(session);
-			}
-			return;
-		}
-
-		await this.createBackend(session, {
-			loadNativeSessionId: session.pendingNativeSessionId,
-		});
-	}
-
-	private async restartBackend(session: SessionState): Promise<void> {
-		if (session.activePrompt) {
-			throw RequestError.invalidParams("Cannot restart backend during an active prompt");
-		}
-
-		session.nativeStartPromise = undefined;
-		await session.nativeClient?.close();
-		session.nativeClient = undefined;
-		session.backendSessionId = undefined;
-		session.nativeModelId = undefined;
-		await this.createBackend(session);
 	}
 
 	private async getAvailableModels(session: SessionState) {
@@ -1636,8 +1079,7 @@ export class CursorAcpAgent implements Agent {
 
 	private buildConfigOptions(
 		session: SessionState,
-		models: LegacySessionModels | undefined = session.nativeSessionModels ??
-			session.fallbackSessionModels,
+		models: LegacySessionModels | undefined = session.sessionModels,
 	): SessionConfigOption[] {
 		const modeState = availableModes(session.modeId);
 		const configOptions: SessionConfigOption[] = [
@@ -1826,42 +1268,6 @@ export class CursorAcpAgent implements Agent {
 		return `${baseDescription} (id: ${modelId})`;
 	}
 
-	private modelDisplayName(_modelId: string, name: string): string {
-		return name;
-	}
-
-	private async finalizeAssistantTurnCapture(
-		session: SessionState,
-		result: PromptResponse,
-	): Promise<void> {
-		const active = session.activePrompt;
-		if (!active) {
-			return;
-		}
-		if (result.stopReason !== "end_turn") {
-			return;
-		}
-
-		let text = active.assistantTextChunks.join("");
-		if (text.trim().length === 0 && active.turnArtifacts.length > 0) {
-			text = formatTurnRecapMarkdown(active.turnArtifacts);
-			if (text.length > 0) {
-				await this.emitOrQueueNotification(session, {
-					sessionId: session.sessionId,
-					update: {
-						sessionUpdate: "agent_message_chunk",
-						content: { type: "text", text: `${text}\n` },
-					},
-				});
-			}
-		}
-
-		const trimmed = text.trim();
-		if (trimmed.length > 0) {
-			await recordAssistantMessage(session.cwd, session.sessionId, trimmed);
-		}
-	}
-
 	private modeToRunnerOptions(
 		session: SessionState,
 		forceRetry: boolean,
@@ -1889,17 +1295,17 @@ export class CursorAcpAgent implements Agent {
 		}
 	}
 
-	private async ensureLegacyBackendSessionId(session: SessionState): Promise<void> {
-		if (session.backendSessionId) {
+	private async ensureSdkSessionId(session: SessionState): Promise<void> {
+		if (session.sdkSessionId) {
 			return;
 		}
 
 		try {
-			session.backendSessionId = await this.runner.createChat();
+			session.sdkSessionId = await this.runner.createChat();
 			await this.persistSessionMeta(session);
 		} catch (error) {
 			this.logger.error(
-				"[cursor-acp] create-chat failed, using lazy backend session binding",
+				"[cursor-acp] SDK createChat failed, using lazy session binding",
 				error,
 			);
 		}
@@ -1916,11 +1322,11 @@ export class CursorAcpAgent implements Agent {
 		const modeSettings = this.modeToRunnerOptions(session, forceRetry);
 		const assistantTextChunks: string[] = [];
 
-		await this.ensureLegacyBackendSessionId(session);
+		await this.ensureSdkSessionId(session);
 
 		const run = this.runner.startPrompt({
 			workspace: session.cwd,
-			backendSessionId: session.backendSessionId,
+			sdkSessionId: session.sdkSessionId,
 			prompt: promptText,
 			images,
 			modelId: session.modelId,
@@ -1937,8 +1343,8 @@ export class CursorAcpAgent implements Agent {
 					logger: this.logger,
 				});
 
-				if (mapped.backendSessionId) {
-					session.backendSessionId = mapped.backendSessionId;
+				if (mapped.sdkSessionId) {
+					session.sdkSessionId = mapped.sdkSessionId;
 					await this.persistSessionMeta(session);
 				}
 
@@ -2079,54 +1485,6 @@ export class CursorAcpAgent implements Agent {
 		}
 	}
 
-	private async handleNativeSessionUpdate(
-		session: SessionState,
-		notification: SessionNotification,
-	): Promise<void> {
-		appendDebugLog("native.update.raw", notification.update);
-		const update = normalizeNativeToolUpdateForClient(
-			notification.update,
-			this.clientCapabilities,
-		);
-		appendDebugLog("native.update.normalized", update);
-
-		if (session.activePrompt) {
-			appendAssistantTextFromNativeChunk(update, session.activePrompt.assistantTextChunks);
-			recordTurnArtifactsFromNativeSessionUpdate(session.activePrompt.turnArtifacts, update);
-		}
-
-		if (update.sessionUpdate === "current_mode_update") {
-			const translatedMode = this.translateNativeMode(session, update.currentModeId);
-			this.setSessionModeState(session, translatedMode);
-			await this.persistSessionMeta(session);
-			await this.emitOrQueueNotification(session, {
-				sessionId: session.sessionId,
-				update: {
-					sessionUpdate: "current_mode_update",
-					currentModeId: translatedMode,
-				},
-			});
-			return;
-		}
-
-		if (update.sessionUpdate === "available_commands_update") {
-			session.nativeAvailableCommands = update.availableCommands ?? [];
-			await this.emitOrQueueNotification(session, {
-				sessionId: session.sessionId,
-				update: {
-					sessionUpdate: "available_commands_update",
-					availableCommands: this.availableCommandsForSession(session),
-				},
-			});
-			return;
-		}
-
-		await this.emitOrQueueNotification(session, {
-			sessionId: session.sessionId,
-			update,
-		});
-	}
-
 	private async emitOrQueueNotification(
 		session: SessionState,
 		notification: SessionNotification,
@@ -2150,153 +1508,22 @@ export class CursorAcpAgent implements Agent {
 		}
 	}
 
-	private hasNativeSlashCommand(session: SessionState, commandName: string): boolean {
-		const normalized = normalizeSlashCommandName(commandName).toLowerCase();
-		return session.nativeAvailableCommands.some(
-			(command) => normalizeSlashCommandName(command.name).toLowerCase() === normalized,
-		);
-	}
-
 	private availableCommandsForSession(session: SessionState): AvailableCommand[] {
-		return mergeAvailableSlashCommands(
-			session.nativeAvailableCommands,
-			session.customSlashCommands,
-			session.customSkills,
-		);
-	}
-
-	/**
-	 * Native `cursor-agent acp` uses the backend session id in payloads; the outer ACP client
-	 * only knows the wrapper session id. Rewrite when the id is missing or matches the backend.
-	 */
-	private rewriteNativeExtensionParams(
-		session: SessionState,
-		params: Record<string, unknown>,
-	): Record<string, unknown> {
-		const sid = params.sessionId;
-		const backendId = session.backendSessionId;
-		if (
-			sid === undefined ||
-			(typeof sid === "string" && backendId !== undefined && sid === backendId)
-		) {
-			return { ...params, sessionId: session.sessionId };
-		}
-
-		return { ...params };
-	}
-
-	private async handleNativePermissionRequest(
-		session: SessionState,
-		request: RequestPermissionRequest,
-	): Promise<RequestPermissionResponse> {
-		if (session.cancelled) {
-			return { outcome: { outcome: "cancelled" } };
-		}
-
-		if (session.modeId === "yolo") {
-			return this.approvePermissionRequest(request);
-		}
-
-		return await this.client.requestPermission({
-			...request,
-			sessionId: session.sessionId,
-			toolCall: normalizePermissionToolCallTitle(request.toolCall),
-		});
-	}
-
-	private approvePermissionRequest(request: RequestPermissionRequest): RequestPermissionResponse {
-		const normalizedKinds = request.options.map((option) => ({
-			optionId: option.optionId,
-			kind: option.kind.replace(/-/g, "_"),
-		}));
-
-		const allowAlways = normalizedKinds.find((option) => option.kind === "allow_always");
-		if (allowAlways) {
-			return {
-				outcome: {
-					outcome: "selected",
-					optionId: allowAlways.optionId,
-				},
-			};
-		}
-
-		const allowOnce = normalizedKinds.find((option) => option.kind === "allow_once");
-		if (allowOnce) {
-			return {
-				outcome: {
-					outcome: "selected",
-					optionId: allowOnce.optionId,
-				},
-			};
-		}
-
-		const fallback = request.options.find((option) => option.kind.startsWith("allow"));
-		if (!fallback) {
-			throw RequestError.internalError(
-				undefined,
-				"Native ACP permission request did not expose an allow option",
-			);
-		}
-
-		return {
-			outcome: {
-				outcome: "selected",
-				optionId: fallback.optionId,
-			},
-		};
-	}
-
-	private modeToNativeMode(modeId: SessionModeId): NativeModeId {
-		switch (modeId) {
-			case "default":
-			case "auto-review":
-			case "yolo":
-				return "agent";
-			case "ask":
-				return "ask";
-			case "plan":
-				return "plan";
-		}
-	}
-
-	private translateNativeMode(session: SessionState, nativeModeId: string): SessionModeId {
-		switch (nativeModeId) {
-			case "agent":
-				return session.lastAgentModeId;
-			case "ask":
-				return "ask";
-			case "plan":
-				return "plan";
-			default:
-				return session.modeId;
-		}
+		return mergeAvailableSlashCommands([], session.customSlashCommands, session.customSkills);
 	}
 
 	private async applySessionMode(session: SessionState, modeId: SessionModeId): Promise<void> {
-		const canSetNativeMode =
-			session.nativeClient?.alive &&
-			!(session.nativeStartPromise && !session.backendSessionId);
-
-		if (canSetNativeMode) {
-			const nativeMode = this.modeToNativeMode(modeId);
-			await session.nativeClient!.setNativeMode(nativeMode);
-			session.appliedNativeModeId = nativeMode;
-		}
-
 		this.setSessionModeState(session, modeId);
 		await this.persistSessionMeta(session);
 	}
 
 	private setSessionModeState(session: SessionState, modeId: SessionModeId): void {
 		session.modeId = modeId;
-		if (isAgentSessionMode(modeId)) {
-			session.lastAgentModeId = modeId;
-		}
 	}
 
 	private async persistSessionMeta(session: SessionState): Promise<void> {
 		await recordSessionMeta(session.cwd, session.sessionId, {
-			backendSessionId: session.backendSessionId,
+			sdkSessionId: session.sdkSessionId,
 			modeId: session.modeId,
 			modelId: session.configuredModelId ?? session.modelId,
 			thinkingLevel: session.configuredThinkingLevel ?? session.thinkingLevel,

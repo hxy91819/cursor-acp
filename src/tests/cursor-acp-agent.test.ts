@@ -188,6 +188,49 @@ describe("CursorAcpAgent SDK behavior", () => {
 		);
 	});
 
+	it("applies ACP defaults and reports config changes to the client", async () => {
+		const h = makeHarness();
+		await h.agent.initialize(initRequest());
+		const session = await h.agent.newSession(
+			newSessionRequest({
+				cwd: configDir,
+				default_mode: "ask",
+				default_model: "composer-2.5",
+			}),
+		);
+		expect(session.modes?.currentModeId).toBe("ask");
+		await h.agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "fast",
+			value: "false",
+		});
+		expect(
+			h.client.updates.some(
+				(u) =>
+					u.sessionId === session.sessionId &&
+					u.update.sessionUpdate === "config_option_update",
+			),
+		).toBe(true);
+		await h.agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "hello" }],
+		});
+		expect(h.prompts[0]).toMatchObject({
+			modeId: "ask",
+			modelId: "composer-2.5",
+			fastValue: "false",
+		});
+	});
+
+	it("handles built-in slash commands without starting an SDK prompt", async () => {
+		const h = makeHarness();
+		await h.agent.initialize(initRequest());
+		const { sessionId } = await h.agent.newSession(newSessionRequest({ cwd: configDir }));
+		await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/mode ask" }] });
+		expect(h.prompts).toHaveLength(0);
+		expect((await readSessionMeta(sessionFilePath(configDir, sessionId))).modeId).toBe("ask");
+	});
+
 	for (const method of ["load", "resume"] as const) {
 		it(`keeps ACP and SDK session IDs and replays history through ${method}`, async () => {
 			const h = makeHarness();

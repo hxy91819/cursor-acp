@@ -151,7 +151,7 @@ describe("session-storage", () => {
 	});
 
 	describe("session metadata", () => {
-		it("records and reads the latest backend session id and mode", async () => {
+		it("records and reads the latest SDK session id and mode", async () => {
 			const cwd = "/Users/test/project";
 			const sessionId = "test-session";
 
@@ -171,6 +171,24 @@ describe("session-storage", () => {
 				sdkSessionId: "backend-2",
 				modeId: "yolo",
 				modelId: "gpt-5.2",
+			});
+		});
+
+		it("loads the SDK session id from metadata written before the field rename", async () => {
+			const cwd = "/Users/test/project";
+			const sessionId = "old-session";
+			await ensureSessionDir(cwd);
+			fs.writeFileSync(
+				sessionFilePath(cwd, sessionId),
+				JSON.stringify({
+					type: "session_meta",
+					sessionId,
+					cwd,
+					backendSessionId: "agent-existing",
+				}) + "\n",
+			);
+			expect(await readSessionMeta(sessionFilePath(cwd, sessionId))).toMatchObject({
+				sdkSessionId: "agent-existing",
 			});
 		});
 	});

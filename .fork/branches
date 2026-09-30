@@ -15,5 +15,5 @@ feature/model-parameters needs-feedback # SDK 模型参数透传与按线程选�
 fix/model-discovery-errors needs-feedback # 模型发现失败或空目录明确报错，避免缓存 Auto 兜底目录
 fix/vite-ghsa-p9ff-h696-f583 needs-feedback # Vitest 传递依赖 Vite 固定到已修复的 7.x（CVE-2026-39363）
 fix/bb-permission-mode needs-feedback # 按 BB 权限模式配置 Cursor SDK 的 full 与 accept-edits 行为
-fix/sdk-session-resume needs-feedback # 保持 ACP 恢复时的 Cursor SDK agent ID，覆盖 load 与 resume
+fix/sdk-session-resume reported https://github.com/raphaelluethy/cursor-acp/issues/5 # 保持 ACP 恢复时的 Cursor SDK agent ID，覆盖 load 与 resume
 feature/sdk-only-backend needs-feedback # 叠在 fix/sdk-session-resume 上；移除旧 Cursor agent/Native/CLI 后端，仅保留 SDK

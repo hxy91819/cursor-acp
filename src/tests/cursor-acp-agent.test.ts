@@ -11,6 +11,7 @@ import { CursorAcpAgent } from "../cursor-acp-agent.js";
 import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { CursorRunner, RunPromptOptions, CursorStreamEvent } from "../cursor-runner.js";
 import {
+	readSessionCheckpoint,
 	readSessionMeta,
 	recordAssistantMessage,
 	recordSessionCheckpoint,
@@ -262,6 +263,13 @@ describe("CursorAcpAgent SDK behavior", () => {
 			const history = await readFile(sessionFilePath(cwd, sessionId), "utf8");
 			expect(history).not.toContain("Mode set to");
 			expect((await readSessionMeta(sessionFilePath(cwd, sessionId))).modeId).toBe("ask");
+			expect(
+				await readSessionCheckpoint(
+					sessionFilePath(cwd, sessionId),
+					sessionId,
+					"saved-snapshot",
+				),
+			).toMatchObject({ modeId: "ask", sdkSessionId: "saved-snapshot" });
 		},
 	);
 

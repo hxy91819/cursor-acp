@@ -223,6 +223,48 @@ describe("CursorAcpAgent SDK behavior", () => {
 		expect((await prompt)._meta?.["cursor-acp/checkpoint"]).toBe("saved-snapshot");
 	});
 
+	it.each(["slash", "mode", "config"])(
+		"rejects %s changes while saving a snapshot",
+		async (entry) => {
+			let release!: (id: string) => void;
+			const checkpointChat = vi.fn(
+				() =>
+					new Promise<string>((resolve) => {
+						release = resolve;
+					}),
+			);
+			const h = makeHarness(undefined, checkpointChat);
+			const { sessionId, cwd } = await loadFixture(h, "load");
+			const prompt = h.agent.prompt({
+				sessionId,
+				prompt: [{ type: "text", text: "finish" }],
+			});
+			await vi.waitFor(() => expect(checkpointChat).toHaveBeenCalledOnce());
+			try {
+				const mutation =
+					entry === "slash"
+						? h.agent.prompt({
+								sessionId,
+								prompt: [{ type: "text", text: "/mode yolo" }],
+							})
+						: entry === "mode"
+							? h.agent.setSessionMode({ sessionId, modeId: "yolo" })
+							: h.agent.setSessionConfigOption({
+									sessionId,
+									configId: "mode",
+									value: "yolo",
+								});
+				await expect(mutation).rejects.toThrow(/active|in progress/);
+			} finally {
+				release("saved-snapshot");
+				await prompt;
+			}
+			const history = await readFile(sessionFilePath(cwd, sessionId), "utf8");
+			expect(history).not.toContain("Mode set to");
+			expect((await readSessionMeta(sessionFilePath(cwd, sessionId))).modeId).toBe("ask");
+		},
+	);
+
 	it("forks an earlier completed turn after reload without copying later history or settings", async () => {
 		const checkpointChat = vi
 			.fn()

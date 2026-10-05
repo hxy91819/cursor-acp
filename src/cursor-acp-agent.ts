@@ -633,6 +633,12 @@ export class CursorAcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const session = this.requireSession(params.sessionId);
+		if (session.activeRun) {
+			throw RequestError.invalidParams(
+				undefined,
+				"Cannot send a prompt while another prompt is in progress",
+			);
+		}
 		let promptText = promptToCursorText(params);
 		const promptImages = promptToCursorImages(params);
 
@@ -1597,6 +1603,12 @@ export class CursorAcpAgent implements Agent {
 	}
 
 	private async applySessionMode(session: SessionState, modeId: SessionModeId): Promise<void> {
+		if (session.activeRun) {
+			throw RequestError.invalidParams(
+				undefined,
+				"Cannot change mode during an active prompt",
+			);
+		}
 		this.setSessionModeState(session, modeId);
 		await this.persistSessionMeta(session);
 	}

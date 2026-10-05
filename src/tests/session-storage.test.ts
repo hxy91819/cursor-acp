@@ -168,6 +168,7 @@ describe("session-storage", () => {
 
 			const meta = await readSessionMeta(sessionFilePath(cwd, sessionId));
 			expect(meta).toEqual({
+				cwd,
 				sdkSessionId: "backend-2",
 				modeId: "yolo",
 				modelId: "gpt-5.2",

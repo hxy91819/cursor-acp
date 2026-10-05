@@ -1061,9 +1061,7 @@ export class CursorAcpAgent implements Agent {
 			return await work();
 		} finally {
 			session.notificationsReady = true;
-			setTimeout(() => {
-				void this.flushPendingNotifications(session);
-			}, 0);
+			await this.flushPendingNotifications(session);
 		}
 	}
 

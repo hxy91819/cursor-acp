@@ -141,7 +141,6 @@ async function loadFixture(h: ReturnType<typeof makeHarness>, method: "load" | "
 	await h.agent.initialize(initRequest());
 	if (method === "load") await h.agent.loadSession({ sessionId, cwd, mcpServers: [] });
 	else await h.agent.resumeSession({ sessionId, cwd });
-	await new Promise((resolve) => setTimeout(resolve, 0));
 	return { sessionId, cwd };
 }
 
@@ -320,11 +319,9 @@ describe("CursorAcpAgent SDK behavior", () => {
 	});
 
 	for (const method of ["load", "resume"] as const) {
-		it(`keeps ACP and SDK session IDs and replays history through ${method}`, async () => {
+		it(`replays history before ${method} resolves and keeps ACP and SDK session IDs`, async () => {
 			const h = makeHarness();
 			const { sessionId } = await loadFixture(h, method);
-			await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "next" }] });
-			expect(h.prompts[0]?.sdkSessionId).toBe("agent-persisted");
 			expect(
 				h.client.updates.some(
 					(u) =>
@@ -334,6 +331,14 @@ describe("CursorAcpAgent SDK behavior", () => {
 						u.update.content.text === "ACK",
 				),
 			).toBe(true);
+			const replayCount = h.client.updates.length;
+			await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "next" }] });
+			expect(h.prompts[0]?.sdkSessionId).toBe("agent-persisted");
+			expect(
+				h.client.updates
+					.slice(replayCount)
+					.some((u) => u.update.sessionUpdate === "agent_message_chunk"),
+			).toBe(false);
 		});
 	}
 

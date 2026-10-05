@@ -17,3 +17,4 @@ fix/vite-ghsa-p9ff-h696-f583 needs-feedback # Vitest 传递依赖 Vite 固定到
 fix/bb-permission-mode needs-feedback # 按 BB 权限模式配置 Cursor SDK 的 full 与 accept-edits 行为
 fix/sdk-session-resume reported https://github.com/raphaelluethy/cursor-acp/issues/5 # 保持 ACP 恢复时的 Cursor SDK agent ID，覆盖 load 与 resume
 feature/sdk-only-backend needs-feedback # 叠在 fix/sdk-session-resume 上；移除旧 Cursor agent/Native/CLI 后端，仅保留 SDK
+feature/session-fork needs-feedback # 叠在 feature/sdk-only-backend 上并合入 feature/cursor-sdk-1-0-32；复制 SDK checkpoint，支持独立末尾 Fork、跨目录及重启恢复

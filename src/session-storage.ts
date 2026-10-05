@@ -187,23 +187,90 @@ export async function readSessionMeta(filePath: string): Promise<{
 	return {};
 }
 
+export async function recordSessionCheckpoint(
+	cwd: string,
+	sessionId: string,
+	meta: Omit<SessionMetaEntry, "type" | "timestamp" | "sessionId" | "cwd"> & {
+		sdkSessionId: string;
+	},
+): Promise<string> {
+	const checkpointId = meta.sdkSessionId;
+	await ensureSessionDir(cwd);
+	await fs.promises.appendFile(
+		sessionFilePath(cwd, sessionId),
+		JSON.stringify({
+			...meta,
+			type: "session_checkpoint",
+			timestamp: new Date().toISOString(),
+			sessionId,
+			cwd,
+			checkpointId,
+		}) + "\n",
+		"utf8",
+	);
+	return checkpointId;
+}
+
+export async function readSessionCheckpoint(
+	filePath: string,
+	sessionId: string,
+	checkpointId: string,
+) {
+	const lines = (await fs.promises.readFile(filePath, "utf8")).split("\n").filter(Boolean);
+	for (const line of lines) {
+		let entry: Record<string, unknown>;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (
+			entry?.type !== "session_checkpoint" ||
+			entry.sessionId !== sessionId ||
+			entry.checkpointId !== checkpointId
+		)
+			continue;
+		if (typeof entry.sdkSessionId !== "string" || typeof entry.cwd !== "string") continue;
+		return {
+			sdkSessionId: entry.sdkSessionId,
+			cwd: entry.cwd,
+			modeId:
+				typeof entry.modeId === "string"
+					? (normalizeModeId(entry.modeId) ?? undefined)
+					: undefined,
+			modelId: typeof entry.modelId === "string" ? entry.modelId : undefined,
+			thinkingLevel:
+				typeof entry.thinkingLevel === "string" ? entry.thinkingLevel : undefined,
+			fastValue: typeof entry.fastValue === "string" ? entry.fastValue : undefined,
+		};
+	}
+	return undefined;
+}
+
 export async function copySessionHistory(
 	filePath: string,
 	cwd: string,
 	sessionId: string,
+	checkpointId?: string,
 ): Promise<void> {
 	const content = await fs.promises.readFile(filePath, "utf-8");
 	const history: string[] = [];
+	let foundCheckpoint = checkpointId === undefined;
 	for (const line of content.split("\n").filter(Boolean)) {
-		let entry: SessionHistoryEntry;
+		let entry: SessionHistoryEntry | { type: "session_checkpoint"; checkpointId: string };
 		try {
-			entry = JSON.parse(line) as SessionHistoryEntry;
+			entry = JSON.parse(line);
 		} catch {
 			continue;
+		}
+		if (entry.type === "session_checkpoint" && entry.checkpointId === checkpointId) {
+			foundCheckpoint = true;
+			break;
 		}
 		if (entry.type !== "user" && entry.type !== "assistant") continue;
 		history.push(JSON.stringify({ ...entry, sessionId, cwd }) + "\n");
 	}
+	if (!foundCheckpoint) throw new Error("Fork source checkpoint history not found");
 	await ensureSessionDir(cwd);
 	await fs.promises.writeFile(sessionFilePath(cwd, sessionId), history.join(""), {
 		encoding: "utf-8",

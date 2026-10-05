@@ -26,7 +26,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 
 ### Wrapper compatibility
 
-- **ACP session lifecycle**: Supports `new`, `resume`, and end-of-session `fork`. Fork copies the local SDK conversation checkpoint into a new agent, inherits session settings and visible history, and uses the child's MCP configuration. Parent and child continue independently, including across process restarts and different working directories.
+- **ACP session lifecycle**: Supports `new`, `resume`, and `fork` at the session tip or a saved successful turn boundary. Fork copies the local SDK conversation checkpoint into a new agent, inherits settings and visible history at that boundary, and uses the child's MCP configuration. Parent and child continue independently, including across process restarts and different working directories.
 - **Session persistence & history replay**: Keeps the ACP session ID separate from the SDK agent ID, and replays visible history on resume/load
 - **Session listing**: Lists past local sessions with optional cwd filtering and pagination
 - **Model listing and selection**: `/model` and ACP config options use the SDK catalog.
@@ -41,11 +41,19 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - The SDK exposes no interactive per-tool approval callback. ACP approval therefore retries the complete turn without Auto Review; work completed before the blocked call may be repeated.
 - Auto Review reduces confirmation noise but is not a security boundary. Use sandboxing and normal least-privilege practices for untrusted workspaces.
 - `debug` mode is not exposed.
-- Fork requires a saved SDK conversation checkpoint and an idle source agent. Historical checkpoint forks and filesystem snapshots are not supported.
+- Fork requires a saved SDK conversation checkpoint and an idle source agent. Historical checkpoints are created only for successful model turns with this adapter version; older turns cannot be reconstructed. In-progress turns, tool-intermediate nodes and filesystem rollback are not supported.
+- Each successful turn preserves an independent SDK snapshot, including its checkpoint blobs. This uses additional disk space as conversation length and turn count grow; automatic snapshot pruning is not implemented.
 
-For BB custom ACP providers, add `"fork": "tip"` to the existing `customAgents`
-entry in a BB version that supports this option. The bundled `cursor-agent acp`
-provider is separate and is not enabled by this adapter.
+For BB custom ACP providers, add `"fork": "checkpoint"` to the existing
+`customAgents` entry in a BB version supporting checkpoint forks. `"tip"` still
+limits BB to end-of-session forks. The bundled `cursor-agent acp` provider is
+separate and is not enabled by this adapter.
+
+The ACP extension `cursor-acp/checkpoint` is advertised as `true` in
+`sessionCapabilities.fork._meta`. Successful `session/prompt` responses return
+the checkpoint ID under the same `_meta` key. Supply that ID in `session/fork`
+request `_meta` to fork at that completed turn; omit it to fork at the tip.
+Checkpoint IDs are validated against the requested source session.
 
 ## Breaking changes (SDK backend and Auto Review default)
 

@@ -96,8 +96,10 @@ import {
 	findSessionFile,
 	getCursorAcpConfigDir,
 	listSessions,
+	readSessionCheckpoint,
 	readSessionMeta,
 	recordAssistantMessage,
+	recordSessionCheckpoint,
 	recordSessionMeta,
 	recordUserMessage,
 	replaySessionHistory,
@@ -299,6 +301,7 @@ interface ActiveRunState {
 
 interface PromptAttemptResult {
 	stopReason: PromptResponse["stopReason"];
+	_meta?: PromptResponse["_meta"];
 	rejectedToolCalls: RejectedToolCall[];
 }
 
@@ -396,7 +399,13 @@ export class CursorAcpAgent implements Agent {
 						supportsSessionModes: true,
 						supportsSetMode: true,
 					},
-					...(this.runner.forkChat ? { fork: {} } : {}),
+					...(this.runner.forkChat
+						? {
+								fork: this.runner.checkpointChat
+									? { _meta: { "cursor-acp/checkpoint": true } }
+									: {},
+							}
+						: {}),
 					resume: {},
 					list: {},
 				},
@@ -425,6 +434,13 @@ export class CursorAcpAgent implements Agent {
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
 		if (!this.runner.forkChat) throw RequestError.methodNotFound("session/fork");
+		const checkpointId = params._meta?.["cursor-acp/checkpoint"];
+		if (
+			checkpointId !== undefined &&
+			(typeof checkpointId !== "string" || !checkpointId || !this.runner.checkpointChat)
+		) {
+			throw RequestError.invalidParams(undefined, "Invalid or unsupported fork checkpoint");
+		}
 		const source = this.sessions[params.sessionId];
 		if (source?.activeRun) {
 			throw RequestError.invalidParams(
@@ -435,13 +451,30 @@ export class CursorAcpAgent implements Agent {
 		const filePath = await findSessionFile(params.sessionId, source?.cwd ?? params.cwd);
 		if (!filePath) throw RequestError.invalidParams(undefined, "Fork source session not found");
 		const meta = await readSessionMeta(filePath);
-		const sourceSdkSessionId = source?.sdkSessionId ?? meta.sdkSessionId;
+		const checkpoint =
+			typeof checkpointId === "string"
+				? await readSessionCheckpoint(filePath, params.sessionId, checkpointId)
+				: undefined;
+		if (checkpointId !== undefined && !checkpoint)
+			throw RequestError.invalidParams(undefined, "Fork source checkpoint not found");
+		const settings =
+			checkpoint ??
+			(source
+				? {
+						modeId: source.modeId,
+						modelId: source.configuredModelId,
+						thinkingLevel: source.configuredThinkingLevel,
+						fastValue: source.configuredFastValue,
+					}
+				: meta);
+		const sourceSdkSessionId =
+			checkpoint?.sdkSessionId ?? source?.sdkSessionId ?? meta.sdkSessionId;
 		if (!sourceSdkSessionId) {
 			throw RequestError.invalidParams(undefined, "Fork source has no Cursor SDK session");
 		}
 		const sdkSessionId = await this.runner.forkChat(
 			sourceSdkSessionId,
-			source?.cwd ?? meta.cwd ?? params.cwd,
+			checkpoint?.cwd ?? source?.cwd ?? meta.cwd ?? params.cwd,
 			params.cwd,
 		);
 		const sessionId = randomUUID();
@@ -450,12 +483,17 @@ export class CursorAcpAgent implements Agent {
 			cwd: params.cwd,
 			mcpServers: params.mcpServers,
 			preferredSdkSessionId: sdkSessionId,
-			preferredModeId: source ? source.modeId : meta.modeId,
-			preferredModelId: source ? source.configuredModelId : meta.modelId,
-			preferredThinkingLevel: source ? source.configuredThinkingLevel : meta.thinkingLevel,
-			preferredFastValue: source ? source.configuredFastValue : meta.fastValue,
+			preferredModeId: settings.modeId,
+			preferredModelId: settings.modelId,
+			preferredThinkingLevel: settings.thinkingLevel,
+			preferredFastValue: settings.fastValue,
 		});
-		await copySessionHistory(filePath, params.cwd, sessionId);
+		await copySessionHistory(
+			filePath,
+			params.cwd,
+			sessionId,
+			typeof checkpointId === "string" ? checkpointId : undefined,
+		);
 		await this.persistSessionMeta(this.requireSession(sessionId));
 		return response;
 	}
@@ -706,7 +744,10 @@ export class CursorAcpAgent implements Agent {
 			}
 		}
 
-		return { stopReason: firstAttempt.stopReason };
+		return {
+			stopReason: firstAttempt.stopReason,
+			...(firstAttempt._meta ? { _meta: firstAttempt._meta } : {}),
+		};
 	}
 
 	async cancel(params: CancelNotification): Promise<void> {
@@ -1404,7 +1445,6 @@ export class CursorAcpAgent implements Agent {
 
 		try {
 			const completed = await run.completed;
-			session.activeRun = undefined;
 
 			if (session.cancelled) {
 				return {
@@ -1432,8 +1472,23 @@ export class CursorAcpAgent implements Agent {
 						assistantTextChunks.join(""),
 					);
 				}
+				let checkpointId: string | undefined;
+				if (this.runner.checkpointChat && session.sdkSessionId) {
+					const snapshotId = await this.runner.checkpointChat(
+						session.sdkSessionId,
+						session.cwd,
+					);
+					checkpointId = await recordSessionCheckpoint(session.cwd, session.sessionId, {
+						sdkSessionId: snapshotId,
+						modeId: session.modeId,
+						modelId: session.configuredModelId,
+						thinkingLevel: session.configuredThinkingLevel,
+						fastValue: session.configuredFastValue,
+					});
+				}
 				return {
 					stopReason: "end_turn",
+					...(checkpointId ? { _meta: { "cursor-acp/checkpoint": checkpointId } } : {}),
 					rejectedToolCalls,
 				};
 			}
@@ -1453,7 +1508,6 @@ export class CursorAcpAgent implements Agent {
 				typeof resultEvent.result === "string" ? resultEvent.result : subtype;
 			throw RequestError.internalError(undefined, resultText || "Cursor failed");
 		} catch (error) {
-			session.activeRun = undefined;
 			if (session.cancelled) {
 				return {
 					stopReason: "cancelled",
@@ -1466,6 +1520,8 @@ export class CursorAcpAgent implements Agent {
 			}
 
 			throw RequestError.internalError(undefined, String(error));
+		} finally {
+			session.activeRun = undefined;
 		}
 	}
 

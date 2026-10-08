@@ -255,7 +255,7 @@ describe("CursorAcpAgent SDK behavior", () => {
 									configId: "mode",
 									value: "yolo",
 								});
-				await expect(mutation).rejects.toThrow(/active|in progress/);
+				await expect(mutation).rejects.toThrow(/active|in progress|in flight/);
 			} finally {
 				release("saved-snapshot");
 				await prompt;

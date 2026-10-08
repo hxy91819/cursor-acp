@@ -19,3 +19,4 @@ fix/sdk-session-resume reported https://github.com/raphaelluethy/cursor-acp/issu
 feature/sdk-only-backend needs-feedback # 叠在 fix/sdk-session-resume 上；移除旧 Cursor agent/Native/CLI 后端，仅保留 SDK
 feature/session-fork needs-feedback # 叠在 feature/sdk-only-backend 上并合入 feature/cursor-sdk-1-0-32；复制 SDK checkpoint，支持独立末尾 Fork、跨目录及重启恢复
 feature/historical-session-fork needs-feedback # 叠在 feature/session-fork 上；已完成回合 checkpoint 上独立 Fork，保留快照设置并拒绝未落盘变更
+feature/sdk-usage-ledger needs-feedback # 叠在 feature/sdk-only-backend 上并合入 SDK 1.0.32 与 Vite 安全修复；将真实 SDK usage 写入 BB Usage 的 Cursor 账本

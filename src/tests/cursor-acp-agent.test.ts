@@ -11,8 +11,10 @@ import { CursorAcpAgent } from "../cursor-acp-agent.js";
 import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { CursorRunner, RunPromptOptions, CursorStreamEvent } from "../cursor-runner.js";
 import {
+	readSessionCheckpoint,
 	readSessionMeta,
 	recordAssistantMessage,
+	recordSessionCheckpoint,
 	recordSessionMeta,
 	recordUserMessage,
 	sessionFilePath,
@@ -65,13 +67,19 @@ function makeHarness(
 		steering?: boolean;
 		steerOutcome?: "complete_delivered" | "revert_to_followup";
 		forkChat?: CursorRunner["forkChat"];
+		checkpointChat?: CursorRunner["checkpointChat"];
+		resultEvent?: CursorStreamEvent;
 	} = {},
 ) {
 	const client = new FakeClient();
 	const prompts: RunPromptOptions[] = [];
 	const steers: string[] = [];
 	let events: CursorStreamEvent[] = [];
-	let resultEvent: CursorStreamEvent = { type: "result", subtype: "success", is_error: false };
+	let resultEvent: CursorStreamEvent = harnessOptions.resultEvent ?? {
+		type: "result",
+		subtype: "success",
+		is_error: false,
+	};
 	let blockRun = false;
 	let resolveRun: (() => void) | undefined;
 	const runner: CursorRunner = {
@@ -79,6 +87,7 @@ function makeHarness(
 		listModels: async () => models,
 		createChat: async () => "agent-created",
 		forkChat: harnessOptions.forkChat,
+		checkpointChat: harnessOptions.checkpointChat,
 		startPrompt(options) {
 			prompts.push(options);
 			const runEvents = events;
@@ -171,6 +180,190 @@ async function loadFixture(h: ReturnType<typeof makeHarness>, method: "load" | "
 }
 
 describe("CursorAcpAgent SDK behavior", () => {
+	it.each(["error", "max_turns"])("does not snapshot a %s result", async (subtype) => {
+		const checkpointChat = vi.fn(async () => "unexpected-snapshot");
+		const h = makeHarness({
+			checkpointChat,
+			resultEvent: {
+				type: "result",
+				subtype,
+				is_error: subtype === "error",
+			},
+		});
+		const { sessionId } = await loadFixture(h, "load");
+		const prompt = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "test" }] });
+		if (subtype === "error") await expect(prompt).rejects.toThrow();
+		else expect((await prompt)._meta).toBeUndefined();
+		expect(checkpointChat).not.toHaveBeenCalled();
+	});
+
+	it("does not snapshot local commands or canceled model turns", async () => {
+		const checkpointChat = vi.fn(async () => "unexpected-snapshot");
+		const h = makeHarness({ checkpointChat });
+		const { sessionId } = await loadFixture(h, "load");
+		expect(
+			(await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/status" }] }))
+				._meta,
+		).toBeUndefined();
+		h.blockRun();
+		const prompt = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "cancel me" }] });
+		await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+		await h.agent.cancel({ sessionId });
+		h.releaseRun();
+		expect(await prompt).toEqual({ stopReason: "cancelled" });
+		expect(checkpointChat).not.toHaveBeenCalled();
+	});
+
+	it("rejects malformed and foreign checkpoints before cloning", async () => {
+		const forkChat = vi.fn(async () => "unexpected-child");
+		const h = makeHarness({
+			forkChat,
+			checkpointChat: vi.fn(async () => "snapshot"),
+		});
+		const { sessionId, cwd } = await loadFixture(h, "load");
+		await recordSessionCheckpoint(cwd, "other-session", { sdkSessionId: "foreign-checkpoint" });
+		for (const checkpoint of [false, "", "foreign-checkpoint"]) {
+			await expect(
+				h.agent.unstable_forkSession({
+					sessionId,
+					cwd,
+					_meta: { "cursor-acp/checkpoint": checkpoint },
+				}),
+			).rejects.toThrow(/checkpoint/);
+		}
+		expect(forkChat).not.toHaveBeenCalled();
+	});
+
+	it("keeps the turn active until its snapshot has been saved", async () => {
+		let release!: (id: string) => void;
+		const checkpointChat = vi.fn(
+			() =>
+				new Promise<string>((resolve) => {
+					release = resolve;
+				}),
+		);
+		const forkChat = vi.fn(async () => "child");
+		const h = makeHarness({ forkChat, checkpointChat });
+		const { sessionId, cwd } = await loadFixture(h, "load");
+		const prompt = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "finish" }] });
+		await vi.waitFor(() => expect(checkpointChat).toHaveBeenCalledOnce());
+		await expect(h.agent.unstable_forkSession({ sessionId, cwd })).rejects.toThrow(
+			"in progress",
+		);
+		expect(forkChat).not.toHaveBeenCalled();
+		release("saved-snapshot");
+		expect((await prompt)._meta?.["cursor-acp/checkpoint"]).toBe("saved-snapshot");
+	});
+
+	it.each(["slash", "mode", "config"])(
+		"rejects %s changes while saving a snapshot",
+		async (entry) => {
+			let release!: (id: string) => void;
+			const checkpointChat = vi.fn(
+				() =>
+					new Promise<string>((resolve) => {
+						release = resolve;
+					}),
+			);
+			const h = makeHarness({ checkpointChat });
+			const { sessionId, cwd } = await loadFixture(h, "load");
+			const prompt = h.agent.prompt({
+				sessionId,
+				prompt: [{ type: "text", text: "finish" }],
+			});
+			await vi.waitFor(() => expect(checkpointChat).toHaveBeenCalledOnce());
+			try {
+				const mutation =
+					entry === "slash"
+						? h.agent.prompt({
+								sessionId,
+								prompt: [{ type: "text", text: "/mode yolo" }],
+							})
+						: entry === "mode"
+							? h.agent.setSessionMode({ sessionId, modeId: "yolo" })
+							: h.agent.setSessionConfigOption({
+									sessionId,
+									configId: "mode",
+									value: "yolo",
+								});
+				await expect(mutation).rejects.toThrow(/active|in progress|in flight/);
+			} finally {
+				release("saved-snapshot");
+				await prompt;
+			}
+			const history = await readFile(sessionFilePath(cwd, sessionId), "utf8");
+			expect(history).not.toContain("Mode set to");
+			expect((await readSessionMeta(sessionFilePath(cwd, sessionId))).modeId).toBe("ask");
+			expect(
+				await readSessionCheckpoint(
+					sessionFilePath(cwd, sessionId),
+					sessionId,
+					"saved-snapshot",
+				),
+			).toMatchObject({ modeId: "ask", sdkSessionId: "saved-snapshot" });
+		},
+	);
+
+	it("forks an earlier completed turn after reload without copying later history or settings", async () => {
+		const checkpointChat = vi
+			.fn()
+			.mockResolvedValueOnce("agent-snapshot-first")
+			.mockResolvedValueOnce("agent-snapshot-later");
+		const h = makeHarness({ checkpointChat });
+		await h.agent.initialize(initRequest());
+		const parent = await h.agent.newSession(newSessionRequest({ cwd: configDir }));
+		await h.agent.setSessionMode({ sessionId: parent.sessionId, modeId: "ask" });
+		h.setEvents([
+			{
+				type: "assistant",
+				message: { role: "assistant", content: [{ type: "text", text: "early-reply" }] },
+			},
+		]);
+		const completed = await h.agent.prompt({
+			sessionId: parent.sessionId,
+			prompt: [{ type: "text", text: "early-input" }],
+		});
+		const checkpointId = completed._meta?.["cursor-acp/checkpoint"];
+		expect(checkpointId).toEqual(expect.any(String));
+		await h.agent.setSessionMode({ sessionId: parent.sessionId, modeId: "yolo" });
+		const later = await h.agent.prompt({
+			sessionId: parent.sessionId,
+			prompt: [{ type: "text", text: "later-secret" }],
+		});
+		expect(later._meta?.["cursor-acp/checkpoint"]).toBe("agent-snapshot-later");
+		const forkChat = vi.fn(async () => "agent-historical-child");
+		const restored = makeHarness({ forkChat, checkpointChat });
+		const child = await restored.agent.unstable_forkSession({
+			sessionId: parent.sessionId,
+			cwd: `${configDir}/child`,
+			mcpServers: [],
+			_meta: { "cursor-acp/checkpoint": checkpointId },
+		});
+		expect(forkChat).toHaveBeenCalledWith(
+			"agent-snapshot-first",
+			configDir,
+			`${configDir}/child`,
+		);
+		const content = await readFile(
+			sessionFilePath(`${configDir}/child`, child.sessionId),
+			"utf8",
+		);
+		expect(content).toContain("early-input");
+		expect(content).not.toContain("later-secret");
+		expect(
+			(await readSessionMeta(sessionFilePath(`${configDir}/child`, child.sessionId))).modeId,
+		).toBe("ask");
+		await expect(
+			restored.agent.unstable_forkSession({
+				sessionId: parent.sessionId,
+				cwd: configDir,
+				mcpServers: [],
+				_meta: { "cursor-acp/checkpoint": "unknown" },
+			}),
+		).rejects.toThrow(/checkpoint/);
+		expect(forkChat).toHaveBeenCalledTimes(1);
+	});
+
 	it("forks a persisted source into a new workspace with independent IDs and child MCP", async () => {
 		const forkChat = vi.fn(async () => "agent-child");
 		const h = makeHarness({ forkChat });

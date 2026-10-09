@@ -93,6 +93,37 @@ describe("SDK checkpoint forks", () => {
 		).toEqual(new Uint8Array([7, 9]));
 	});
 
+	it("forks an immutable historical snapshot after the parent replaces its blobs and reopens", async () => {
+		const snapshotId = await cloneSdkSession(source, source, "agent-parent", "/source");
+		await source.checkpoints.delete({ filter: { agentIds: ["agent-parent"] } });
+		await source.checkpoints.create({
+			agentId: "agent-parent",
+			blobId: "f00d",
+			data: new Uint8Array([99]),
+		});
+		const parent = await source.agents.get({ agentId: "agent-parent" });
+		if (!parent) throw new Error("missing fixture");
+		await source.agents.update({
+			agent: { ...parent, latestCheckpoint: { schemaVersion: 1, rootBlobId: "f00d" } },
+		});
+		await source.dispose();
+		source = await SqliteLocalAgentStore.open({
+			workspaceRef: "/source",
+			stateRoot: join(directory, "source"),
+		});
+		const childId = await cloneSdkSession(source, target, snapshotId, "/child");
+		expect((await target.agents.get({ agentId: childId }))?.latestCheckpoint?.rootBlobId).toBe(
+			"root",
+		);
+		expect(await target.checkpoints.get({ agentId: childId, blobId: "root" })).toEqual(
+			new Uint8Array([1, 2, 3]),
+		);
+		expect(await target.checkpoints.get({ agentId: childId, blobId: "dependency" })).toEqual(
+			new Uint8Array([7, 9]),
+		);
+		expect(await target.checkpoints.get({ agentId: childId, blobId: "f00d" })).toBeNull();
+	});
+
 	it("rejects a missing source and active runs without creating a child", async () => {
 		await expect(cloneSdkSession(source, target, "missing", "/child")).rejects.toThrow(
 			"not found",

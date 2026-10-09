@@ -52,6 +52,13 @@ function sdkSession(id: string) {
 }
 
 describe("CursorSdkRunner", () => {
+	it("rejects an empty SDK catalog instead of inventing an Auto-only catalog", async () => {
+		sdkMocks.modelList.mockResolvedValueOnce([]);
+		await expect(new CursorSdkRunner("test-key", logger).listModels()).rejects.toThrow(
+			"Cursor SDK returned an empty model catalog",
+		);
+	});
+
 	beforeEach(() => {
 		vi.clearAllMocks();
 	});

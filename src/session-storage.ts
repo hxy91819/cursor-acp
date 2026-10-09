@@ -119,6 +119,7 @@ export async function recordSessionMeta(
  * Read session metadata from the session file, returning the latest stored values.
  */
 export async function readSessionMeta(filePath: string): Promise<{
+	cwd?: string;
 	sdkSessionId?: string;
 	modeId?: SessionModeId;
 	modelId?: string;
@@ -128,6 +129,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 	try {
 		const content = await fs.promises.readFile(filePath, "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
+		let lastCwd: string | undefined;
 		let lastBackend: string | undefined;
 		let lastModeId: SessionModeId | undefined;
 		let lastModelId: string | undefined;
@@ -137,6 +139,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			try {
 				const entry = JSON.parse(line) as {
 					type?: string;
+					cwd?: string;
 					sdkSessionId?: string;
 					backendSessionId?: string;
 					modeId?: string;
@@ -147,6 +150,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 				if (entry.type !== "session_meta") {
 					continue;
 				}
+				if (typeof entry.cwd === "string") lastCwd = entry.cwd;
 				if (entry.sdkSessionId || entry.backendSessionId) {
 					lastBackend = entry.sdkSessionId ?? entry.backendSessionId;
 				}
@@ -170,6 +174,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			}
 		}
 		return {
+			cwd: lastCwd,
 			sdkSessionId: lastBackend,
 			modeId: lastModeId,
 			modelId: lastModelId,
@@ -180,6 +185,30 @@ export async function readSessionMeta(filePath: string): Promise<{
 		// file not readable
 	}
 	return {};
+}
+
+export async function copySessionHistory(
+	filePath: string,
+	cwd: string,
+	sessionId: string,
+): Promise<void> {
+	const content = await fs.promises.readFile(filePath, "utf-8");
+	const history: string[] = [];
+	for (const line of content.split("\n").filter(Boolean)) {
+		let entry: SessionHistoryEntry;
+		try {
+			entry = JSON.parse(line) as SessionHistoryEntry;
+		} catch {
+			continue;
+		}
+		if (entry.type !== "user" && entry.type !== "assistant") continue;
+		history.push(JSON.stringify({ ...entry, sessionId, cwd }) + "\n");
+	}
+	await ensureSessionDir(cwd);
+	await fs.promises.writeFile(sessionFilePath(cwd, sessionId), history.join(""), {
+		encoding: "utf-8",
+		flag: "wx",
+	});
 }
 
 /**

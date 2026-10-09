@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -64,6 +64,7 @@ function makeHarness(
 	harnessOptions: {
 		steering?: boolean;
 		steerOutcome?: "complete_delivered" | "revert_to_followup";
+		forkChat?: CursorRunner["forkChat"];
 	} = {},
 ) {
 	const client = new FakeClient();
@@ -77,6 +78,7 @@ function makeHarness(
 		supportsMidTurnSteering: harnessOptions.steering,
 		listModels: async () => models,
 		createChat: async () => "agent-created",
+		forkChat: harnessOptions.forkChat,
 		startPrompt(options) {
 			prompts.push(options);
 			const runEvents = events;
@@ -165,11 +167,97 @@ async function loadFixture(h: ReturnType<typeof makeHarness>, method: "load" | "
 	await h.agent.initialize(initRequest());
 	if (method === "load") await h.agent.loadSession({ sessionId, cwd, mcpServers: [] });
 	else await h.agent.resumeSession({ sessionId, cwd });
-	await new Promise((resolve) => setTimeout(resolve, 0));
 	return { sessionId, cwd };
 }
 
 describe("CursorAcpAgent SDK behavior", () => {
+	it("forks a persisted source into a new workspace with independent IDs and child MCP", async () => {
+		const forkChat = vi.fn(async () => "agent-child");
+		const h = makeHarness({ forkChat });
+		const { sessionId, cwd } = await loadFixture(h, "load");
+		const parentFile = sessionFilePath(cwd, sessionId);
+		const parentHistory = await readFile(parentFile, "utf-8");
+		const targetCwd = path.join(configDir, "child");
+		const mcpServers = [{ name: "child-tools", command: "node", args: ["child.js"], env: [] }];
+		const child = await makeHarness({ forkChat }).agent.unstable_forkSession({
+			sessionId,
+			cwd: targetCwd,
+			mcpServers,
+		});
+		expect(child.sessionId).not.toBe(sessionId);
+		expect(forkChat).toHaveBeenCalledWith("agent-persisted", cwd, targetCwd);
+		expect(await readSessionMeta(sessionFilePath(targetCwd, child.sessionId))).toMatchObject({
+			cwd: targetCwd,
+			sdkSessionId: "agent-child",
+			modelId: "composer-2.5",
+			modeId: "ask",
+			fastValue: "false",
+		});
+		expect(await readFile(parentFile, "utf-8")).toBe(parentHistory);
+		const resumed = makeHarness();
+		await resumed.agent.loadSession({ sessionId: child.sessionId, cwd: targetCwd, mcpServers });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(
+			resumed.client.updates.some(
+				(u) =>
+					u.sessionId === child.sessionId &&
+					u.update.sessionUpdate === "agent_message_chunk" &&
+					u.update.content.type === "text" &&
+					u.update.content.text === "ACK",
+			),
+		).toBe(true);
+		await resumed.agent.prompt({
+			sessionId: child.sessionId,
+			prompt: [{ type: "text", text: "continue child" }],
+		});
+		expect(resumed.prompts[0]).toMatchObject({
+			sdkSessionId: "agent-child",
+			workspace: targetCwd,
+			modeId: "ask",
+			mcpServers,
+		});
+	});
+
+	it("inherits live settings and rejects a fork during an active prompt", async () => {
+		const forkChat = vi.fn(async () => "agent-child");
+		const h = makeHarness({ forkChat });
+		const { sessionId, cwd } = await loadFixture(h, "load");
+		await h.agent.setSessionConfigOption({ sessionId, configId: "fast", value: "true" });
+		const child = await h.agent.unstable_forkSession({ sessionId, cwd });
+		expect((await readSessionMeta(sessionFilePath(cwd, child.sessionId))).fastValue).toBe(
+			"true",
+		);
+		h.blockRun();
+		const prompt = h.agent.prompt({
+			sessionId,
+			prompt: [{ type: "text", text: "still working" }],
+		});
+		await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+		await expect(h.agent.unstable_forkSession({ sessionId, cwd })).rejects.toThrow(
+			"in progress",
+		);
+		expect(forkChat).toHaveBeenCalledOnce();
+		h.releaseRun();
+		await prompt;
+	});
+
+	it("does not advertise unsupported forks or silently replace a missing source with a blank session", async () => {
+		const unsupported = makeHarness();
+		expect(
+			(await unsupported.agent.initialize(initRequest())).agentCapabilities
+				?.sessionCapabilities?.fork,
+		).toBeUndefined();
+		const forkChat = vi.fn(async () => "agent-child");
+		const h = makeHarness({ forkChat });
+		expect(
+			(await h.agent.initialize(initRequest())).agentCapabilities?.sessionCapabilities?.fork,
+		).toEqual({});
+		await expect(
+			h.agent.unstable_forkSession({ sessionId: "missing", cwd: configDir }),
+		).rejects.toThrow("source session not found");
+		expect(forkChat).not.toHaveBeenCalled();
+	});
+
 	it("advertises SDK models and ACP mode and parameter controls", async () => {
 		const h = makeHarness();
 		await h.agent.initialize(
@@ -257,11 +345,9 @@ describe("CursorAcpAgent SDK behavior", () => {
 	});
 
 	for (const method of ["load", "resume"] as const) {
-		it(`keeps ACP and SDK session IDs and replays history through ${method}`, async () => {
+		it(`replays history before ${method} resolves and keeps ACP and SDK session IDs`, async () => {
 			const h = makeHarness();
 			const { sessionId } = await loadFixture(h, method);
-			await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "next" }] });
-			expect(h.prompts[0]?.sdkSessionId).toBe("agent-persisted");
 			expect(
 				h.client.updates.some(
 					(u) =>
@@ -271,6 +357,14 @@ describe("CursorAcpAgent SDK behavior", () => {
 						u.update.content.text === "ACK",
 				),
 			).toBe(true);
+			const replayCount = h.client.updates.length;
+			await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "next" }] });
+			expect(h.prompts[0]?.sdkSessionId).toBe("agent-persisted");
+			expect(
+				h.client.updates
+					.slice(replayCount)
+					.some((u) => u.update.sessionUpdate === "agent_message_chunk"),
+			).toBe(false);
 		});
 	}
 

@@ -105,6 +105,7 @@ import {
 	SessionModeId,
 } from "./settings.js";
 import {
+	copySessionHistory,
 	findSessionFile,
 	getCursorAcpConfigDir,
 	listSessions,
@@ -438,7 +439,7 @@ export class CursorAcpAgent implements Agent {
 						supportsSessionModes: true,
 						supportsSetMode: true,
 					},
-					fork: {},
+					...(this.runner.forkChat ? { fork: {} } : {}),
 					resume: {},
 					list: {},
 					close: {},
@@ -467,11 +468,40 @@ export class CursorAcpAgent implements Agent {
 	}
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+		if (!this.runner.forkChat) throw RequestError.methodNotFound("session/fork");
+		const source = this.sessions[params.sessionId];
+		if (source?.activeRun) {
+			throw RequestError.invalidParams(
+				undefined,
+				"Cannot fork while a prompt is in progress",
+			);
+		}
+		const filePath = await findSessionFile(params.sessionId, source?.cwd ?? params.cwd);
+		if (!filePath) throw RequestError.invalidParams(undefined, "Fork source session not found");
+		const meta = await readSessionMeta(filePath);
+		const sourceSdkSessionId = source?.sdkSessionId ?? meta.sdkSessionId;
+		if (!sourceSdkSessionId) {
+			throw RequestError.invalidParams(undefined, "Fork source has no Cursor SDK session");
+		}
+		const sdkSessionId = await this.runner.forkChat(
+			sourceSdkSessionId,
+			source?.cwd ?? meta.cwd ?? params.cwd,
+			params.cwd,
+		);
 		const sessionId = randomUUID();
-		return await this.createSession({
+		const response = await this.createSession({
 			sessionId,
 			cwd: params.cwd,
+			mcpServers: params.mcpServers,
+			preferredSdkSessionId: sdkSessionId,
+			preferredModeId: source ? source.modeId : meta.modeId,
+			preferredModelId: source ? source.configuredModelId : meta.modelId,
+			preferredThinkingLevel: source ? source.configuredThinkingLevel : meta.thinkingLevel,
+			preferredFastValue: source ? source.configuredFastValue : meta.fastValue,
 		});
+		await copySessionHistory(filePath, params.cwd, sessionId);
+		await this.persistSessionMeta(this.requireSession(sessionId));
+		return response;
 	}
 
 	async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -1379,9 +1409,7 @@ export class CursorAcpAgent implements Agent {
 			return await work();
 		} finally {
 			session.notificationsReady = true;
-			setTimeout(() => {
-				void this.flushPendingNotifications(session);
-			}, 0);
+			await this.flushPendingNotifications(session);
 		}
 	}
 

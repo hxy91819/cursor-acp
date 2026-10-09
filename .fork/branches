@@ -9,7 +9,7 @@ base upstream-main/20260924-d422bdd
 fork-tooling          internal                                          # fork 维护规则与聚合脚本
 feature/cursor-sdk-1-0-32 pr-open    https://github.com/raphaelluethy/cursor-acp/pull/3 # 升级 Cursor SDK 至 1.0.32 并适配署名补丁
 feature/mid-turn-steering pr-open https://github.com/raphaelluethy/cursor-acp/pull/4 # 叠在 feature/cursor-sdk-1-0-32 上；支持 Cursor SDK 文本 steer
-fix/cancel-config-sync pr-open https://github.com/raphaelluethy/cursor-acp/pull/6 # 叠在 feature/mid-turn-steering 上；修复取消后配置同步时序及同值 fast 设置
+fix/cancel-config-sync pr-open https://github.com/raphaelluethy/cursor-acp/pull/4 # 叠在 feature/mid-turn-steering 上；修复取消后配置同步时序及同值 fast 设置；原 PR #6 已合并入 #4 的提交范围并关闭，源分支保留
 feature/skill-discovery pr-open https://github.com/raphaelluethy/cursor-acp/pull/7 # 技能发现与调用、全局规则和自动技能清单
 feature/model-parameters pr-open https://github.com/raphaelluethy/cursor-acp/pull/8 # SDK 模型参数透传与按线程选择 1M 上下文
 fix/model-discovery-errors pr-open https://github.com/raphaelluethy/cursor-acp/pull/9 # 模型发现失败或空目录明确报错，避免缓存 Auto 兜底目录
@@ -18,5 +18,5 @@ fix/bb-permission-mode pr-open https://github.com/raphaelluethy/cursor-acp/pull/
 fix/sdk-session-resume pr-open https://github.com/raphaelluethy/cursor-acp/pull/12 # 修复 issue #5；保持 ACP 恢复时的 Cursor SDK agent ID，覆盖 load 与 resume
 feature/sdk-only-backend pr-open https://github.com/raphaelluethy/cursor-acp/pull/13 # 叠在 fix/sdk-session-resume 上；移除旧 Cursor agent/Native/CLI 后端，仅保留 SDK；含公开 API 删除
 feature/session-fork pr-open https://github.com/raphaelluethy/cursor-acp/pull/14 # 叠在 feature/sdk-only-backend 上并合入 feature/cursor-sdk-1-0-32；复制 SDK checkpoint，支持独立末尾 Fork、跨目录及重启恢复
-feature/historical-session-fork pr-open https://github.com/raphaelluethy/cursor-acp/pull/15 # 叠在 feature/session-fork 上；已完成回合 checkpoint 上独立 Fork，保留快照设置并拒绝未落盘变更
+feature/historical-session-fork pr-open https://github.com/raphaelluethy/cursor-acp/pull/14 # 叠在 feature/session-fork 上；已完成回合 checkpoint 上独立 Fork，保留快照设置并拒绝未落盘变更；原 PR #15 已合并入 #14 的提交范围并关闭，源分支保留
 feature/sdk-usage-ledger pr-open https://github.com/raphaelluethy/cursor-acp/pull/16 # 叠在 feature/sdk-only-backend 上并合入 SDK 1.0.32 与 Vite 安全修复；将真实 SDK usage 写入 BB Usage 的 Cursor 账本

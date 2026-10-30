@@ -46,5 +46,6 @@ export interface CursorRunner {
 	supportsMidTurnSteering?: boolean;
 	listModels(): Promise<CursorModelDescriptor[]>;
 	createChat(): Promise<string>;
+	forkChat?(sdkSessionId: string, sourceWorkspace: string, workspace: string): Promise<string>;
 	startPrompt(options: RunPromptOptions): CursorPromptRun;
 }

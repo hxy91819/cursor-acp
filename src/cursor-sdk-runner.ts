@@ -9,6 +9,7 @@ import {
 	type Run,
 } from "@cursor/sdk";
 import { randomUUID } from "node:crypto";
+import { SqliteLocalAgentStore } from "@cursor/sdk/sqlite";
 import { applyCursorCliAttributionEnvironment } from "./cursor-cli-config.js";
 import {
 	sdkMessageToCursorStreamEvent,
@@ -16,6 +17,7 @@ import {
 } from "./cursor-sdk-event-adapter.js";
 import { getCursorApiKey } from "./cursor-sdk-config.js";
 import { buildLocalAgentOptions } from "./cursor-sdk-local-options.js";
+import { cloneSdkSession } from "./cursor-sdk-session-fork.js";
 import type {
 	CursorPromptRun,
 	CursorRunner,
@@ -142,6 +144,27 @@ export class CursorSdkRunner implements CursorRunner {
 
 	async createChat(): Promise<string> {
 		return `${PENDING_AGENT_PREFIX}${randomUUID()}`;
+	}
+
+	async forkChat(
+		sdkSessionId: string,
+		sourceWorkspace: string,
+		workspace: string,
+	): Promise<string> {
+		const sourceStore = await SqliteLocalAgentStore.open({ workspaceRef: sourceWorkspace });
+		try {
+			const targetStore =
+				sourceWorkspace === workspace
+					? sourceStore
+					: await SqliteLocalAgentStore.open({ workspaceRef: workspace });
+			try {
+				return await cloneSdkSession(sourceStore, targetStore, sdkSessionId, workspace);
+			} finally {
+				if (targetStore !== sourceStore) await targetStore.dispose();
+			}
+		} finally {
+			await sourceStore.dispose();
+		}
 	}
 
 	startPrompt(options: RunPromptOptions): CursorPromptRun {

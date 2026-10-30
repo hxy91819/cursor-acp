@@ -146,6 +146,10 @@ export class CursorSdkRunner implements CursorRunner {
 		return `${PENDING_AGENT_PREFIX}${randomUUID()}`;
 	}
 
+	async checkpointChat(sdkSessionId: string, workspace: string): Promise<string> {
+		return await this.forkChat(sdkSessionId, workspace, workspace);
+	}
+
 	async forkChat(
 		sdkSessionId: string,
 		sourceWorkspace: string,

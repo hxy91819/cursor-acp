@@ -88,6 +88,7 @@ import {
 	parseLeadingSlashCommand,
 	promptToCursorImages,
 	promptToCursorText,
+	splitSystemInstructionsPrefix,
 } from "./prompt-conversion.js";
 import {
 	CustomSlashCommand,
@@ -1032,12 +1033,16 @@ export class CursorAcpAgent implements Agent {
 		// injected with, so the agent sees identical content either way.
 		let promptText = steerText ?? promptToCursorText(params);
 		const promptImages = steerText ? undefined : promptToCursorImages(params);
-		const slash = parseLeadingSlashCommand(promptText);
+		const { prefix, prompt } = splitSystemInstructionsPrefix(promptText);
+		const slash = parseLeadingSlashCommand(prompt);
 		if (slash.hasSlash && !this.hasNativeSlashCommand(session, slash.command)) {
 			const handled = await handleSlashCommand(slash.command, slash.args, {
 				session,
 				auth: this.auth,
-				listModels: async () => await this.runner.listModels(),
+				listModels: async () =>
+					withContextModelVariants(
+						withCliModelParameters(await this.runner.listModels()),
+					),
 				availableCommands: this.availableCommandsForSession(session),
 				onModeChanged: async (modeId) => {
 					await this.applySessionMode(session, modeId);
@@ -1075,9 +1080,10 @@ export class CursorAcpAgent implements Agent {
 					slash.command,
 					slash.args,
 					session.customSlashCommands,
-				) ?? resolveSkillSlashCommandPrompt(slash.command, session.customSkills);
+				) ??
+				resolveSkillSlashCommandPrompt(slash.command, slash.args, session.customSkills);
 			if (customPrompt) {
-				promptText = customPrompt;
+				promptText = prefix + customPrompt;
 			}
 		}
 		session.deliveredSteers = [];
@@ -1493,7 +1499,7 @@ export class CursorAcpAgent implements Agent {
 	private async loadSessionSlashExtensions(session: SessionState): Promise<void> {
 		const [customSlashCommands, customSkills] = await Promise.allSettled([
 			loadCustomSlashCommands(session.cwd),
-			loadCustomSkills(session.cwd),
+			loadCustomSkills(session.cwd, undefined, this.logger),
 		]);
 
 		if (customSlashCommands.status === "fulfilled") {

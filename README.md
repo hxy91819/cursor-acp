@@ -348,6 +348,8 @@ Attribution is global-only; Cursor project `.cursor/cli.json` files support perm
 
 Sessions are persisted under `~/.cursor-acp/sessions/` (or `$CURSOR_ACP_CONFIG_DIR/sessions/` if set). Each project has an encoded subdirectory; session history is stored as JSONL files with user and assistant messages for resume and replay.
 
+After an adapter process exits during a prompt, the next prompt can recover its recorded SDK run while retaining the same agent and conversation checkpoint. A per-agent process lock protects live adapter prompts; active runs without a matching adapter ownership record are left untouched.
+
 ### Token usage ledger
 
 Reported SDK `usage` events are appended to `~/.cursor/usage.jsonl` in the

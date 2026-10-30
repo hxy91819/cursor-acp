@@ -257,6 +257,7 @@ function createAgentTestHarness(
 		createSessionBlockers?: Array<Promise<void> | undefined>;
 		models?: CursorModelDescriptor[];
 		supportsSteering?: boolean;
+		listModels?: () => Promise<CursorModelDescriptor[]>;
 	} = {},
 ) {
 	const backends: FakeNativeBackend[] = [];
@@ -282,6 +283,7 @@ function createAgentTestHarness(
 			return "legacy-chat-1";
 		},
 		async listModels() {
+			if (backendOptions.listModels) return await backendOptions.listModels();
 			return (
 				backendOptions.models ?? [
 					{ modelId: "auto", name: "Auto", current: true },
@@ -493,6 +495,24 @@ describe("1M context model selection", () => {
 			delete process.env.CURSOR_ACP_CONFIG_DIR;
 			await rm(tempRoot, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("model discovery failures", () => {
+	it("rejects a failed discovery instead of advertising Auto and recovers on retry", async () => {
+		const listModels = vi
+			.fn<() => Promise<CursorModelDescriptor[]>>()
+			.mockRejectedValueOnce(new Error("Model catalog unavailable"))
+			.mockResolvedValueOnce([{ modelId: "composer-2.5", name: "Composer 2.5" }]);
+		const { agent } = createAgentTestHarness({ listModels });
+		await agent.initialize(initRequest());
+		await expect(agent.newSession(newSessionRequest())).rejects.toThrow(
+			"Model catalog unavailable",
+		);
+		const session = await agent.newSession(newSessionRequest());
+		expect(session.models?.availableModels).toEqual(
+			expect.arrayContaining([expect.objectContaining({ modelId: "composer-2.5" })]),
+		);
 	});
 });
 

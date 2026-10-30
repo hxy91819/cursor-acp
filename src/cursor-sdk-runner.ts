@@ -13,6 +13,7 @@ import {
 	sdkMessageToCursorStreamEvent,
 	sdkRunResultToCursorResultEvent,
 } from "./cursor-sdk-event-adapter.js";
+import { SdkRunOwnership } from "./cursor-sdk-run-ownership.js";
 import { getCursorApiKey } from "./cursor-sdk-config.js";
 import { buildLocalAgentOptions } from "./cursor-sdk-local-options.js";
 import type {
@@ -31,6 +32,7 @@ const PENDING_AGENT_PREFIX = "pending-";
 const CANCELLATION_DRAIN_TIMEOUT_MS = 15_000;
 
 interface ManagedAgent {
+	ownership: SdkRunOwnership;
 	agent: SDKAgent;
 	configKey: string;
 	cwd: string;
@@ -88,6 +90,7 @@ function sdkMcpServers(
 
 export class CursorSdkRunner implements CursorRunner {
 	private readonly agents = new Map<string, ManagedAgent>();
+	private readonly ownedAgents = new WeakMap<SDKAgent, ManagedAgent>();
 
 	constructor(
 		private readonly apiKey: string | undefined = getCursorApiKey(),
@@ -184,6 +187,16 @@ export class CursorSdkRunner implements CursorRunner {
 		let resultEvent: CursorStreamEvent | undefined;
 		let stderr = "";
 		let agent: SDKAgent | undefined;
+		let ownership: SdkRunOwnership | undefined;
+		const pending = new Set<Promise<unknown>>();
+		const track = <T>(operation: Promise<T>): Promise<T> => {
+			pending.add(operation);
+			void operation.then(
+				() => pending.delete(operation),
+				() => pending.delete(operation),
+			);
+			return operation;
+		};
 		const unfinishedToolCalls = new Map<string, Extract<SDKMessage, { type: "tool_call" }>>();
 		let assistantReply = new CursorTransportFailure();
 		let nextAssistantStartsSegment = true;
@@ -203,13 +216,16 @@ export class CursorSdkRunner implements CursorRunner {
 			]);
 			if (agentOutcome.cancelled) {
 				void agentCompleted
-					.then((lateAgent) => this.retireAgent(lateAgent))
+					.then((lateAgent) => this.retireAgent(lateAgent.agent))
 					.catch(() => undefined);
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
 				await emit(resultEvent);
 				return { events, resultEvent, stderr, exitCode: 0 };
 			}
-			agent = agentOutcome.value;
+			const resolved = agentOutcome.value;
+			await resolved.ownership.acquire(resolved.agent.agentId);
+			ownership = resolved.ownership;
+			agent = resolved.agent;
 			await emit({ type: "system", subtype: "init", session_id: agent.agentId });
 			if (hooks.isCancelled()) {
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
@@ -245,46 +261,55 @@ export class CursorSdkRunner implements CursorRunner {
 			const message = options.images?.length
 				? { text: options.prompt, images: options.images }
 				: options.prompt;
-			const sendCompleted = agent.send(message, sendOptions);
+			const sendCompleted = track(agent.send(message, sendOptions));
 			const sendOutcome = await this.completeOperation(sendCompleted, hooks, agent);
 			if (sendOutcome.cancelled && (!sendOutcome.settled || !sendOutcome.succeeded)) {
-				void sendCompleted.then((run) => run.cancel()).catch(() => undefined);
+				track(
+					sendCompleted.then(async (run) => {
+						await run.cancel();
+						await run.wait();
+					}),
+				).catch(() => undefined);
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
 				await emit(resultEvent);
 				return { events, resultEvent, stderr, exitCode: 0 };
 			}
 			const run = sendOutcome.value;
+			const terminal = track(run.wait());
+			void terminal.catch(() => undefined);
 			hooks.setCancelRun(() => run.cancel());
-			const streamCompleted = (async () => {
-				for await (const message of run.stream()) {
-					let duplicateRunningToolCall = false;
-					if (message.type === "tool_call") {
-						nextAssistantStartsSegment = true;
-						if (message.status === "running") {
-							duplicateRunningToolCall = unfinishedToolCalls.has(message.call_id);
-							unfinishedToolCalls.set(message.call_id, message);
-						} else {
-							unfinishedToolCalls.delete(message.call_id);
-						}
-					} else if (message.type === "assistant") {
-						if (nextAssistantStartsSegment) {
-							assistantReply = new CursorTransportFailure();
-							nextAssistantStartsSegment = false;
-						}
-						for (const content of message.message.content) {
-							if (content.type === "text") {
-								assistantReply.push(content.text);
+			const streamCompleted = track(
+				(async () => {
+					for await (const message of run.stream()) {
+						let duplicateRunningToolCall = false;
+						if (message.type === "tool_call") {
+							nextAssistantStartsSegment = true;
+							if (message.status === "running") {
+								duplicateRunningToolCall = unfinishedToolCalls.has(message.call_id);
+								unfinishedToolCalls.set(message.call_id, message);
+							} else {
+								unfinishedToolCalls.delete(message.call_id);
+							}
+						} else if (message.type === "assistant") {
+							if (nextAssistantStartsSegment) {
+								assistantReply = new CursorTransportFailure();
+								nextAssistantStartsSegment = false;
+							}
+							for (const content of message.message.content) {
+								if (content.type === "text") {
+									assistantReply.push(content.text);
+								}
 							}
 						}
+						if (duplicateRunningToolCall) {
+							continue;
+						}
+						for (const adapted of sdkMessageToCursorStreamEvent(message)) {
+							await emit(adapted);
+						}
 					}
-					if (duplicateRunningToolCall) {
-						continue;
-					}
-					for (const adapted of sdkMessageToCursorStreamEvent(message)) {
-						await emit(adapted);
-					}
-				}
-			})();
+				})(),
+			);
 
 			const streamOutcome = await this.completeOperation(streamCompleted, hooks, agent);
 			if (streamOutcome.cancelled) {
@@ -296,7 +321,7 @@ export class CursorSdkRunner implements CursorRunner {
 			if (hooks.isCancelled()) {
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
 			} else {
-				const waitCompleted = run.wait();
+				const waitCompleted = terminal;
 				const waitOutcome = await this.completeOperation(waitCompleted, hooks, agent);
 				if (waitOutcome.cancelled) {
 					resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
@@ -361,6 +386,12 @@ export class CursorSdkRunner implements CursorRunner {
 			);
 			await emit(resultEvent);
 			return { events, resultEvent, stderr, exitCode: hooks.isCancelled() ? 0 : 1 };
+		} finally {
+			if (ownership) {
+				const held = ownership;
+				if (pending.size === 0) held.release();
+				else void Promise.allSettled(pending).then(() => held.release());
+			}
 		}
 	}
 
@@ -401,18 +432,22 @@ export class CursorSdkRunner implements CursorRunner {
 	}
 
 	private retireAgent(agent: SDKAgent): void {
-		for (const [agentId, managed] of this.agents) {
-			if (managed.agent !== agent) {
-				continue;
-			}
-			this.agents.delete(agentId);
-			try {
-				agent.close();
-			} catch (error) {
-				this.logger.error?.("[cursor-acp] Failed to close unusable SDK agent", error);
-			}
-			return;
+		const managed = this.ownedAgents.get(agent);
+		if (!managed) return;
+		this.ownedAgents.delete(agent);
+		if (this.agents.get(agent.agentId) === managed) this.agents.delete(agent.agentId);
+		managed.ownership.close();
+		try {
+			agent.close();
+		} catch (error) {
+			this.logger.error?.("[cursor-acp] Failed to close unusable SDK agent", error);
 		}
+	}
+
+	private cacheAgent(managed: ManagedAgent): ManagedAgent {
+		this.agents.set(managed.agent.agentId, managed);
+		this.ownedAgents.set(managed.agent, managed);
+		return managed;
 	}
 
 	private agentConfig(options: RunPromptOptions) {
@@ -446,35 +481,57 @@ export class CursorSdkRunner implements CursorRunner {
 		};
 	}
 
-	private async resolveAgent(options: RunPromptOptions): Promise<SDKAgent> {
+	private async resolveAgent(options: RunPromptOptions): Promise<ManagedAgent> {
 		const backendSessionId = options.backendSessionId;
 		const configKey = this.agentConfig(options).key;
 		if (backendSessionId) {
 			const cached = this.agents.get(backendSessionId);
 			if (cached && cached.cwd === options.workspace && cached.configKey === configKey) {
-				return cached.agent;
+				return cached;
 			}
 			if (cached) {
-				cached.agent.close();
-				this.agents.delete(backendSessionId);
+				if (cached.ownership.isActive)
+					throw new Error(`Agent ${backendSessionId} already has an active ACP prompt`);
+				this.retireAgent(cached.agent);
 			}
 
 			if (isResumableAgentId(backendSessionId)) {
-				const agent = await Agent.resume(backendSessionId, this.agentOptions(options));
-				this.agents.set(backendSessionId, {
+				const ownership = await SdkRunOwnership.open(options.workspace);
+				let agent: SDKAgent;
+				try {
+					const config = this.agentOptions(options);
+					agent = await Agent.resume(backendSessionId, {
+						...config,
+						local: { ...config.local, store: ownership.store },
+					});
+				} catch (error) {
+					ownership.close();
+					throw error;
+				}
+				return this.cacheAgent({
+					ownership,
 					agent,
 					cwd: options.workspace,
 					configKey,
 				});
-				return agent;
 			}
 		}
 
-		const agent = await Agent.create(this.agentOptions(options));
+		const ownership = await SdkRunOwnership.open(options.workspace);
+		let agent: SDKAgent;
+		try {
+			const config = this.agentOptions(options);
+			agent = await Agent.create({
+				...config,
+				local: { ...config.local, store: ownership.store },
+			});
+		} catch (error) {
+			ownership.close();
+			throw error;
+		}
 		if (backendSessionId) {
 			this.agents.delete(backendSessionId);
 		}
-		this.agents.set(agent.agentId, { agent, cwd: options.workspace, configKey });
-		return agent;
+		return this.cacheAgent({ ownership, agent, cwd: options.workspace, configKey });
 	}
 }

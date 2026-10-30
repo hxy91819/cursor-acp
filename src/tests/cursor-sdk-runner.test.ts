@@ -1,7 +1,8 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SqliteLocalAgentStore } from "@cursor/sdk/sqlite";
 import {
 	CURSOR_ACP_ATTRIBUTE_COMMITS_ENV,
 	CURSOR_ACP_ATTRIBUTE_PRS_ENV,
@@ -14,6 +15,8 @@ const sdkMocks = vi.hoisted(() => ({
 	agentResume: vi.fn(),
 	modelList: vi.fn(),
 }));
+
+let workspace: string;
 
 const logger = { log() {}, error() {} };
 const originalConfigDir = process.env.CURSOR_CONFIG_DIR;
@@ -45,10 +48,15 @@ function sdkAgent(agentId: string, messages: unknown[] = []) {
 
 describe("CursorSdkRunner", () => {
 	beforeEach(() => {
+		workspace = mkdtempSync(join(tmpdir(), "cursor-sdk-runner-"));
 		vi.clearAllMocks();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		const storage = await SqliteLocalAgentStore.open({ workspaceRef: workspace });
+		await storage.dispose();
+		rmSync(storage.stateRoot, { recursive: true, force: true });
+		rmSync(workspace, { recursive: true, force: true });
 		vi.useRealTimers();
 		if (originalConfigDir === undefined) delete process.env.CURSOR_CONFIG_DIR;
 		else process.env.CURSOR_CONFIG_DIR = originalConfigDir;
@@ -81,7 +89,7 @@ describe("CursorSdkRunner", () => {
 		});
 
 		const runner = new CursorSdkRunner("test-key", logger);
-		await runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" }).completed;
+		await runner.startPrompt({ workspace: workspace, prompt: "hello" }).completed;
 
 		expect(sdkMocks.agentCreate).toHaveBeenCalledOnce();
 	});
@@ -92,14 +100,14 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 
 		await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			backendSessionId: await runner.createChat(),
 			prompt: "hello",
 		}).completed;
 
 		expect(sdkMocks.agentCreate).toHaveBeenCalledWith(
 			expect.objectContaining({
-				local: expect.objectContaining({ cwd: "/tmp/project", autoReview: true }),
+				local: expect.objectContaining({ cwd: workspace, autoReview: true }),
 			}),
 		);
 	});
@@ -111,13 +119,13 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 
 		await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			backendSessionId: "agent-existing",
 			prompt: "first",
 			reviewPolicy: "auto-review",
 		}).completed;
 		await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			backendSessionId: "agent-existing",
 			prompt: "retry",
 			reviewPolicy: "run-everything",
@@ -141,7 +149,7 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 
 		await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			prompt: "inspect",
 			images: [{ data: "aW1hZ2U=", mimeType: "image/png" }],
 			mcpServers: [{ name: "local", command: "/bin/tool", args: ["serve"], env: [] }],
@@ -182,7 +190,7 @@ describe("CursorSdkRunner", () => {
 		const events: CursorStreamEvent[] = [];
 
 		await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			prompt: "run it",
 			onEvent: (event) => {
 				events.push(event);
@@ -215,7 +223,7 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 
 		const result = await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			prompt: "hello",
 		}).completed;
 
@@ -248,7 +256,7 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 
 		const result = await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			prompt: "explain the error",
 		}).completed;
 
@@ -289,7 +297,7 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 
 		const result = await runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			prompt: "inspect",
 		}).completed;
 
@@ -306,7 +314,7 @@ describe("CursorSdkRunner", () => {
 		sdkMocks.agentCreate.mockReturnValue(created);
 		const runner = new CursorSdkRunner("test-key", logger);
 
-		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		const prompt = runner.startPrompt({ workspace: workspace, prompt: "hello" });
 		prompt.cancel();
 		resolveAgent?.(agent);
 		const result = await prompt.completed;
@@ -325,7 +333,7 @@ describe("CursorSdkRunner", () => {
 		);
 		const runner = new CursorSdkRunner("test-key", logger);
 
-		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		const prompt = runner.startPrompt({ workspace: workspace, prompt: "hello" });
 		prompt.cancel();
 		const result = await prompt.completed;
 
@@ -348,7 +356,7 @@ describe("CursorSdkRunner", () => {
 		};
 		sdkMocks.agentCreate.mockResolvedValue(agent);
 		const runner = new CursorSdkRunner("test-key", logger);
-		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		const prompt = runner.startPrompt({ workspace: workspace, prompt: "hello" });
 
 		await vi.waitFor(() => expect(agent.send).toHaveBeenCalledOnce());
 		prompt.cancel();
@@ -368,7 +376,7 @@ describe("CursorSdkRunner", () => {
 		};
 		sdkMocks.agentCreate.mockResolvedValue(agent);
 		const runner = new CursorSdkRunner("test-key", logger);
-		const prompt = runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" });
+		const prompt = runner.startPrompt({ workspace: workspace, prompt: "hello" });
 		while (agent.send.mock.calls.length === 0) {
 			await Promise.resolve();
 		}
@@ -379,6 +387,52 @@ describe("CursorSdkRunner", () => {
 
 		expect(agent.close).toHaveBeenCalledOnce();
 		expect(result.resultEvent).toMatchObject({ subtype: "cancelled", is_error: false });
+	});
+
+	it("rejects a concurrent prompt without closing its live owner or sending twice", async () => {
+		let acceptSend: ((run: ReturnType<typeof sdkRun>) => void) | undefined;
+		let started: (() => void) | undefined;
+		const sending = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const agent = sdkAgent("agent-concurrent");
+		agent.send.mockImplementationOnce(() => {
+			started?.();
+			return new Promise((resolve) => {
+				acceptSend = resolve;
+			});
+		});
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+		const first = runner.startPrompt({ workspace, prompt: "first" });
+		await sending;
+		const second = await runner.startPrompt({
+			workspace,
+			backendSessionId: agent.agentId,
+			prompt: "second",
+		}).completed;
+		expect(second.stderr).toContain("active ACP prompt");
+		const reconfigured = await runner.startPrompt({
+			workspace,
+			backendSessionId: agent.agentId,
+			prompt: "different policy",
+			reviewPolicy: "run-everything",
+		}).completed;
+		expect(reconfigured.stderr).toContain("active ACP prompt");
+		expect(agent.send).toHaveBeenCalledOnce();
+		expect(agent.close).not.toHaveBeenCalled();
+		acceptSend?.(sdkRun());
+		expect((await first.completed).exitCode).toBe(0);
+		expect(
+			(
+				await runner.startPrompt({
+					workspace,
+					backendSessionId: agent.agentId,
+					prompt: "third",
+				}).completed
+			).exitCode,
+		).toBe(0);
+		expect(agent.send).toHaveBeenCalledTimes(2);
 	});
 
 	it("drains final SDK events after cancellation before completing", async () => {
@@ -425,7 +479,7 @@ describe("CursorSdkRunner", () => {
 		const runner = new CursorSdkRunner("test-key", logger);
 		const events: CursorStreamEvent[] = [];
 		const prompt = runner.startPrompt({
-			workspace: "/tmp/project",
+			workspace: workspace,
 			prompt: "wait",
 			onEvent: (event) => {
 				events.push(event);

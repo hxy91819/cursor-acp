@@ -16,7 +16,7 @@ describe.skipIf(!isOptIn)("Cursor SDK Process-Kill Session Resume E2E", () => {
 		});
 		expect(result.firstExitSignal).toBe("SIGKILL");
 		expect(result.error).toBeUndefined();
-		expect(result.backendSessionIdRetained).toBe(true);
+		expect(result.sdkSessionIdRetained).toBe(true);
 		expect(result.tokenRetained).toBe(true);
 		expect(result.toolCallsAttempted).toBe(0);
 		expect(result.replayLeakedIntoTurn2).toBe(false);
@@ -34,7 +34,7 @@ describe.skipIf(!isOptIn)("Cursor SDK Process-Kill Session Resume E2E", () => {
 		});
 		expect(result.firstExitSignal).toBe("SIGKILL");
 		expect(result.error).toBeUndefined();
-		expect(result.backendSessionIdRetained).toBe(true);
+		expect(result.sdkSessionIdRetained).toBe(true);
 		expect(result.tokenRetained).toBe(true);
 		expect(result.toolCallsAttempted).toBe(0);
 		expect(result.replayLeakedIntoTurn2).toBe(false);

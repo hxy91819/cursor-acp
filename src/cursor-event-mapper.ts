@@ -33,7 +33,7 @@ export interface MappingContext {
 
 export interface MappingResult {
 	notifications: SessionNotification[];
-	backendSessionId?: string;
+	sdkSessionId?: string;
 	currentModeId?: string;
 	rejectedToolCall?: RejectedToolCall;
 }
@@ -132,7 +132,7 @@ export function mapCursorEventToAcp(
 	const logger = context.logger ?? console;
 
 	if (event.type === "system" && event.subtype === "init") {
-		const backendSessionId =
+		const sdkSessionId =
 			typeof event.session_id === "string" && event.session_id.length > 0
 				? event.session_id
 				: undefined;
@@ -143,7 +143,7 @@ export function mapCursorEventToAcp(
 
 		return {
 			notifications,
-			backendSessionId,
+			sdkSessionId,
 			currentModeId: permissionMode,
 		};
 	}

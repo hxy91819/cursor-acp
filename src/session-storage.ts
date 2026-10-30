@@ -27,7 +27,7 @@ export interface SessionMetaEntry {
 	timestamp: string;
 	sessionId: string;
 	cwd: string;
-	backendSessionId?: string;
+	sdkSessionId?: string;
 	modeId?: SessionModeId;
 	modelId?: string;
 	thinkingLevel?: string;
@@ -85,13 +85,13 @@ export async function appendSessionEntry(
 }
 
 /**
- * Record session metadata (e.g. backendSessionId) to the session file.
+ * Record session metadata (e.g. sdkSessionId) to the session file.
  */
 export async function recordSessionMeta(
 	cwd: string,
 	sessionId: string,
 	meta: {
-		backendSessionId?: string;
+		sdkSessionId?: string;
 		modeId?: SessionModeId;
 		modelId?: string;
 		thinkingLevel?: string;
@@ -103,7 +103,7 @@ export async function recordSessionMeta(
 		timestamp: new Date().toISOString(),
 		sessionId,
 		cwd,
-		backendSessionId: meta.backendSessionId,
+		sdkSessionId: meta.sdkSessionId,
 		modeId: meta.modeId,
 		modelId: meta.modelId,
 		thinkingLevel: meta.thinkingLevel,
@@ -119,7 +119,7 @@ export async function recordSessionMeta(
  * Read session metadata from the session file, returning the latest stored values.
  */
 export async function readSessionMeta(filePath: string): Promise<{
-	backendSessionId?: string;
+	sdkSessionId?: string;
 	modeId?: SessionModeId;
 	modelId?: string;
 	thinkingLevel?: string;
@@ -137,6 +137,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			try {
 				const entry = JSON.parse(line) as {
 					type?: string;
+					sdkSessionId?: string;
 					backendSessionId?: string;
 					modeId?: string;
 					modelId?: string;
@@ -146,8 +147,8 @@ export async function readSessionMeta(filePath: string): Promise<{
 				if (entry.type !== "session_meta") {
 					continue;
 				}
-				if (entry.backendSessionId) {
-					lastBackend = entry.backendSessionId;
+				if (entry.sdkSessionId || entry.backendSessionId) {
+					lastBackend = entry.sdkSessionId ?? entry.backendSessionId;
 				}
 				if (typeof entry.modeId === "string") {
 					const normalizedModeId = normalizeModeId(entry.modeId);
@@ -169,7 +170,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			}
 		}
 		return {
-			backendSessionId: lastBackend,
+			sdkSessionId: lastBackend,
 			modeId: lastModeId,
 			modelId: lastModelId,
 			thinkingLevel: lastThinkingLevel,

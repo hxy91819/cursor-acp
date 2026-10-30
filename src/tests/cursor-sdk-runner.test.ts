@@ -121,7 +121,7 @@ describe("CursorSdkRunner", () => {
 
 		await runner.startPrompt({
 			workspace: "/tmp/project",
-			backendSessionId: await runner.createChat(),
+			sdkSessionId: await runner.createChat(),
 			prompt: "hello",
 		}).completed;
 
@@ -189,13 +189,13 @@ describe("CursorSdkRunner", () => {
 
 		await runner.startPrompt({
 			workspace: "/tmp/project",
-			backendSessionId: "agent-existing",
+			sdkSessionId: "agent-existing",
 			prompt: "first",
 			reviewPolicy: "auto-review",
 		}).completed;
 		await runner.startPrompt({
 			workspace: "/tmp/project",
-			backendSessionId: "agent-existing",
+			sdkSessionId: "agent-existing",
 			prompt: "retry",
 			reviewPolicy: "run-everything",
 		}).completed;

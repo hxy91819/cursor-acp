@@ -28,6 +28,7 @@ import type { CursorModelDescriptor } from "../slash-commands.js";
 import {
 	agentTestAccess,
 	ensureNativeBackend,
+	getSessionState,
 	initRequest,
 	newSessionRequest,
 } from "./test-support.js";
@@ -1475,6 +1476,510 @@ describe("CursorAcpAgent", () => {
 
 		delete process.env.CURSOR_ACP_CONFIG_DIR;
 		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	it("reapplies the current fast value after cancel while the old run still exits", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			models: [
+				{ modelId: "auto", name: "Auto", current: true },
+				{ modelId: "composer-2.5", name: "Composer 2.5" },
+				{ modelId: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+			],
+		});
+		await agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({ cwd: "/tmp/cancel-config-sync", default_model: "composer-2.5" }),
+		);
+		expect(session.configOptions?.find((option) => option.id === "fast")).toMatchObject({
+			type: "boolean",
+			currentValue: false,
+		});
+
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+		expect(getSessionState(agent, session.sessionId).activeRun).toBeDefined();
+		await expect(
+			agent.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "fast",
+				value: "bogus",
+			}),
+		).rejects.toMatchObject({ code: -32602, data: "Invalid fast mode: bogus" });
+
+		const response = await agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "fast",
+			type: "boolean",
+			value: false,
+		});
+		expect(response.configOptions.find((option) => option.id === "fast")).toMatchObject({
+			currentValue: false,
+		});
+
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		expect(legacyPromptCalls).toHaveLength(1);
+		finishRun?.();
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(legacyPromptCalls.map((call) => [call.promptText, call.fastValue])).toEqual([
+			["work", "false"],
+			["next turn", "false"],
+		]);
+	});
+
+	it("applies a changed fast value after cancel once the old run exits", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			models: [
+				{ modelId: "auto", name: "Auto", current: true },
+				{ modelId: "composer-2.5", name: "Composer 2.5" },
+				{ modelId: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+			],
+		});
+		await agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp/cancel-config-sync",
+				default_model: "composer-2.5-fast",
+			}),
+		);
+		expect(session.configOptions?.find((option) => option.id === "fast")).toMatchObject({
+			type: "boolean",
+			currentValue: true,
+		});
+
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		expect(legacyPromptCalls[0]?.fastValue).toBe("true");
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+
+		let synced = false;
+		const sync = agent
+			.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "fast",
+				value: "false",
+			})
+			.then((result) => {
+				synced = true;
+				return result;
+			});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(synced).toBe(false);
+
+		finishRun?.();
+		const response = await sync;
+		expect(response.configOptions.find((option) => option.id === "fast")).toMatchObject({
+			currentValue: false,
+		});
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(
+			legacyPromptCalls.map((call) => [call.promptText, call.modelId, call.fastValue]),
+		).toEqual([
+			["work", "composer-2.5-fast", "true"],
+			["next turn", "composer-2.5", "false"],
+		]);
+	});
+
+	it("applies a model change after cancel and still rejects one during a live run", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness();
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(
+			newSessionRequest({ cwd: "/tmp/cancel-config-sync" }),
+		);
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		await expect(
+			agent.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "model",
+				value: "gpt-5.2",
+			}),
+		).rejects.toMatchObject({
+			code: -32602,
+			data: "Cannot change model during an active prompt",
+		});
+
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+		let synced = false;
+		const sync = agent
+			.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "model",
+				value: "gpt-5.2",
+			})
+			.then((result) => {
+				synced = true;
+				return result;
+			});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(synced).toBe(false);
+
+		finishRun?.();
+		const response = await sync;
+		expect(response.configOptions.find((option) => option.id === "model")).toMatchObject({
+			currentValue: "gpt-5.2",
+		});
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(legacyPromptCalls.map((call) => [call.promptText, call.modelId])).toEqual([
+			["work", legacyPromptCalls[0]?.modelId],
+			["next turn", "gpt-5.2"],
+		]);
+	});
+
+	it("applies a thinking change after cancel once the old run exits", async () => {
+		const models: CursorModelDescriptor[] = [
+			{
+				modelId: "gpt-5.6-sol",
+				name: "GPT-5.6 Sol",
+				current: true,
+				parameters: [
+					{
+						id: "reasoning",
+						displayName: "Thinking",
+						values: [
+							{ value: "false", displayName: "Off" },
+							{ value: "true", displayName: "On" },
+						],
+					},
+				],
+				variants: [{ params: [{ id: "reasoning", value: "true" }], isDefault: true }],
+			},
+		];
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			models,
+		});
+		await agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp/cancel-config-sync",
+				default_config_options: { thinking: true },
+			}),
+		);
+		expect(session.configOptions?.find((option) => option.id === "thinking")).toMatchObject({
+			type: "boolean",
+			currentValue: true,
+		});
+
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		expect(legacyPromptCalls[0]?.thinkingLevel).toBe("true");
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+
+		const sync = agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "thinking",
+			type: "boolean",
+			value: false,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		finishRun?.();
+		const response = await sync;
+		expect(response.configOptions.find((option) => option.id === "thinking")).toMatchObject({
+			currentValue: false,
+		});
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(legacyPromptCalls.map((call) => [call.promptText, call.thinkingLevel])).toEqual([
+			["work", "true"],
+			["next turn", "false"],
+		]);
+	});
+
+	it("applies a legacy set_model request after cancel once the old run exits", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness();
+		await agent.initialize(initRequest());
+		const session = await agent.newSession(
+			newSessionRequest({ cwd: "/tmp/cancel-config-sync" }),
+		);
+		let finishRun: (() => void) | undefined;
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+
+		const sync = agent.unstable_setSessionModel({
+			sessionId: session.sessionId,
+			modelId: "gpt-5.4-medium",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		finishRun?.();
+		await sync;
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(legacyPromptCalls.map((call) => [call.promptText, call.modelId])).toEqual([
+			["work", legacyPromptCalls[0]?.modelId],
+			["next turn", "gpt-5.4-medium"],
+		]);
+	});
+
+	it("applies an in-flight config change before the next turn starts", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			models: [
+				{ modelId: "auto", name: "Auto", current: true },
+				{ modelId: "composer-2.5", name: "Composer 2.5" },
+				{ modelId: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+			],
+		});
+		await agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp/cancel-config-sync",
+				default_model: "composer-2.5-fast",
+			}),
+		);
+		let finishRun: (() => void) | undefined;
+		const syncState = { settled: 0 };
+		const runStarts = [] as boolean[];
+		setLegacyPromptHandler(async () => {
+			if (legacyPromptCalls.length === 2) {
+				runStarts.push(syncState.settled === 2);
+			}
+			if (legacyPromptCalls.length === 1) {
+				await new Promise<void>((resolve) => {
+					finishRun = resolve;
+				});
+			}
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		const primary = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await primary).toEqual({ stopReason: "cancelled" });
+
+		const next = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "next turn" }],
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const fastSync = agent
+			.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "fast",
+				value: "false",
+			})
+			.then((result) => {
+				syncState.settled += 1;
+				return result;
+			});
+		const modelSync = agent
+			.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "model",
+				value: "composer-2.5",
+			})
+			.then((result) => {
+				syncState.settled += 1;
+				return result;
+			});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(legacyPromptCalls).toHaveLength(1);
+
+		finishRun?.();
+		await Promise.all([fastSync, modelSync]);
+		expect(await next).toEqual({ stopReason: "end_turn" });
+		expect(runStarts).toEqual([true]);
+		expect(
+			legacyPromptCalls.map((call) => [call.promptText, call.modelId, call.fastValue]),
+		).toEqual([
+			["work", "composer-2.5-fast", "true"],
+			["next turn", "composer-2.5", "false"],
+		]);
+	});
+
+	it("queues a second prompt that waited on the same config change", async () => {
+		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness({
+			models: [
+				{ modelId: "auto", name: "Auto", current: true },
+				{ modelId: "composer-2.5", name: "Composer 2.5" },
+				{ modelId: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+			],
+		});
+		await agent.initialize(
+			initRequest({ clientCapabilities: { session: { configOptions: { boolean: {} } } } }),
+		);
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp/cancel-config-sync",
+				default_model: "composer-2.5-fast",
+			}),
+		);
+		const finishRuns: Array<() => void> = [];
+		setLegacyPromptHandler(
+			async () =>
+				await new Promise((resolve) => {
+					finishRuns.push(() =>
+						resolve({
+							events: [],
+							resultEvent: { type: "result", subtype: "success", is_error: false },
+							stderr: "",
+							exitCode: 0,
+						}),
+					);
+				}),
+		);
+		const first = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "work" }],
+		});
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(1));
+		await agent.cancel({ sessionId: session.sessionId });
+		expect(await first).toEqual({ stopReason: "cancelled" });
+
+		const sync = agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "fast",
+			value: "false",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const earlier = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "earlier" }],
+		});
+		const later = agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "later" }],
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(legacyPromptCalls).toHaveLength(1);
+
+		finishRuns[0]?.();
+		await sync;
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(2));
+		finishRuns[1]?.();
+		await vi.waitFor(() => expect(legacyPromptCalls).toHaveLength(3));
+		finishRuns[2]?.();
+		expect(await Promise.all([earlier, later])).toEqual([
+			{ stopReason: "end_turn" },
+			{ stopReason: "end_turn" },
+		]);
+		expect(
+			legacyPromptCalls.map((call) => [call.promptText, call.modelId, call.fastValue]),
+		).toEqual([
+			["work", "composer-2.5-fast", "true"],
+			["earlier", "composer-2.5", "false"],
+			["later", "composer-2.5", "false"],
+		]);
 	});
 
 	it("falls back to selectors for boolean-shaped parameters on legacy clients", async () => {

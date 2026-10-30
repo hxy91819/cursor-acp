@@ -840,6 +840,16 @@ export class CursorAcpAgent implements Agent {
 				session.cancelResponse!,
 			]);
 		}
+		// A pending configuration change must be in effect before the next run
+		// starts, so a cancelled run that is still exiting cannot leak its
+		// configuration into this turn. Two prompts can wait on the same
+		// change, so admission is re-checked after the wait.
+		if (session.configMutationPromise) {
+			await session.configMutationPromise;
+			if (session.processingPrompts) {
+				return await this.prompt(params);
+			}
+		}
 		session.cancelled = false;
 		session.cancelCleanup = undefined;
 		session.cancelResponse = new Promise((resolve) => {
@@ -1177,9 +1187,10 @@ export class CursorAcpAgent implements Agent {
 	): Promise<LegacySetSessionModelResponse | void> {
 		const session = this.requireSession(params.sessionId);
 		return await this.withSessionConfigMutation(session, async () => {
-			if (session.activePrompt || session.activeRun) {
-				throw RequestError.invalidParams("Cannot change model during an active prompt");
-			}
+			await this.awaitConfigChangeAdmissible(
+				session,
+				"Cannot change model during an active prompt",
+			);
 
 			session.modelId = normalizeModelId(params.modelId);
 			session.configuredModelId = session.modelId;
@@ -1233,9 +1244,10 @@ export class CursorAcpAgent implements Agent {
 		}
 
 		if (configId === "model") {
-			if (session.activePrompt || session.activeRun) {
-				throw RequestError.invalidParams("Cannot change model during an active prompt");
-			}
+			await this.awaitConfigChangeAdmissible(
+				session,
+				"Cannot change model during an active prompt",
+			);
 			session.modelId = normalizeModelId(value);
 			session.configuredModelId = session.modelId;
 			this.syncModelParameters(session);
@@ -1245,9 +1257,6 @@ export class CursorAcpAgent implements Agent {
 		}
 
 		if (configId === FAST_PARAM_ID) {
-			if (session.activePrompt || session.activeRun) {
-				throw RequestError.invalidParams("Cannot change fast mode during an active prompt");
-			}
 			const fastParameter = getFastParameterForModel(session.modelCatalog, session.modelId);
 			if (!fastParameter) {
 				throw RequestError.invalidParams(
@@ -1261,6 +1270,15 @@ export class CursorAcpAgent implements Agent {
 			if (!nextModelId) {
 				throw RequestError.invalidParams(`No model variant for fast mode: ${value}`);
 			}
+			// Reapplying the value the next turn would use anyway changes nothing,
+			// so it is safe while a cancelled run is still exiting.
+			if (nextModelId === session.modelId && session.fastValue === value) {
+				return { configOptions: this.buildConfigOptions(session) };
+			}
+			await this.awaitConfigChangeAdmissible(
+				session,
+				"Cannot change fast mode during an active prompt",
+			);
 			session.modelId = nextModelId;
 			session.configuredModelId = nextModelId;
 			session.fastValue = value;
@@ -1272,11 +1290,10 @@ export class CursorAcpAgent implements Agent {
 		}
 
 		if (configId === THINKING_PARAM_ID) {
-			if (session.activePrompt || session.activeRun) {
-				throw RequestError.invalidParams(
-					"Cannot change thinking level during an active prompt",
-				);
-			}
+			await this.awaitConfigChangeAdmissible(
+				session,
+				"Cannot change thinking level during an active prompt",
+			);
 			const parameterModel = findParameterModelInCatalog(
 				session.modelCatalog,
 				session.modelId,
@@ -1325,6 +1342,26 @@ export class CursorAcpAgent implements Agent {
 				session.configMutationPromise = undefined;
 			}
 		}
+	}
+
+	/**
+	 * `cancel()` settles the ACP prompt as soon as the cancellation is
+	 * acknowledged, but the SDK run can outlive that response. A configuration
+	 * change that actually affects the next turn waits for that run to exit
+	 * instead of failing as if it arrived mid-turn. Changes during a run that
+	 * was not cancelled keep the existing rejection.
+	 */
+	private async awaitConfigChangeAdmissible(
+		session: SessionState,
+		message: string,
+	): Promise<void> {
+		if (!session.activePrompt && !session.activeRun) {
+			return;
+		}
+		if (!session.cancelled) {
+			throw RequestError.invalidParams(message);
+		}
+		await session.turnDrain;
 	}
 
 	private async applyNativeModelIfConnected(session: SessionState): Promise<void> {

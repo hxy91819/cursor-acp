@@ -688,6 +688,11 @@ export class CursorAcpAgent implements Agent {
 		});
 	}
 
+	/** Compatibility alias for clients that call stable `session/resume`. */
+	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+		return await this.unstable_resumeSession(params);
+	}
+
 	async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		const PAGE_SIZE = 50;
 		const sessions = await listSessions(params.cwd ?? undefined);
@@ -1475,6 +1480,7 @@ export class CursorAcpAgent implements Agent {
 			customSkills: [],
 			notificationsReady: false,
 			pendingNotifications: [],
+			backendSessionId: params.preferredBackendSessionId,
 			pendingNativeSessionId: params.preferredBackendSessionId,
 		};
 
